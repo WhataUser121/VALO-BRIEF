@@ -1,0 +1,397 @@
+"""
+로그인한 팀 전용 "우리팀 분석 > 팀 분석" 탭 데이터 조립 + team_stats_summary 캐싱.
+
+services/my_team_stats.py(통계 탭)와 같은 전제로 Henrik을 실시간으로 부르지 않고 DB
+(matches/match_player_stats)만으로 계산한다. 다만 이 탭은 round_detail_json을 라운드
+단위로 파싱해야 해서 계산 비용이 훨씬 크므로, 결과를 team_stats_summary에
+캐싱해두고(cache-aside: 있으면 읽고, 없으면 계산해서 채운 뒤 읽음) 이후 조회는 캐시만
+읽는다.
+
+라운드 단위 파생값은 Henrik 원본에 명시적인 필드가 없어 아래 방식으로 추론한다(프로젝트
+내 유일한 소스이므로 여기 문서화):
+  - 공격/수비: 라운드의 player_stats[].player_team으로 이 매치에서 우리 팀이 Red/Blue
+    중 어느 색이었는지 먼저 알아낸 뒤, 하프(12라운드)마다 그 구간에서 스파이크가 설치된
+    라운드의 plant_events.planted_by.team을 그 구간 전체의 공격 팀으로 본다(발로란트
+    표준 룰 - 사이드는 라운드마다 안 바뀌고 하프 단위로만 바뀜, 연장은 2라운드 단위로
+    스왑). 그 구간에 설치가 한 번도 없으면 공수 판정 불가로 집계에서 제외한다.
+  - 에코 라운드: 그 라운드 우리 팀 5명의 economy.loadout_value 평균이 ECO_THRESHOLD
+    미만이면 에코로 판정한다(공식 정의가 아닌 휴리스틱).
+  - 트레이드 성공률(1v1/1v2): my_team_player_detail.py(개인 분석)와 같은 정의 - "우리
+    팀원이 죽은 교전에서 상대가 몇 명 같이 죽었는지"를 round_phase_analysis.py::
+    nearby_trade_deaths로 계산한다. 1v1 = 상대 1명 이상 같이 죽음(기본 트레이드), 1v2 =
+    2명 이상(가치 트레이드), 각각 전체 사망 횟수 대비 비율(서로 배타적이지 않음) - 라운드
+    승패와 무관하게 죽음-교전 단위로 집계한다.
+  - 타격대(Duelist) vs 타격대: ml/engagement_predictor.py::_duelist_matchup_from_acs를
+    그대로 재사용한다 - 승부예측 쪽(상대팀 실시간 분석)과 같은 정규화 방식으로 "타격대
+    매치업 유불리"의 의미를 앱 전체에서 하나로 유지하기 위함.
+  - skills(스킬 사용 유효성)는 제외한다 - Henrik 응답의 ability_casts가 항상 null로 와서
+    데이터 소스가 없다.
+"""
+import json as json_module
+from datetime import datetime
+
+from sqlalchemy import bindparam, text
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import Session, defer
+
+from ml.engagement_predictor import _duelist_matchup_from_acs
+from services.death_hotspot_service import compute_player_hotspots
+from services.map_coords_service import normalize_location
+from models.match import Match
+from models.match_player_stat import MatchPlayerStat
+from models.riot_account import RiotAccount
+from models.team_stats_summary import TeamStatsSummary
+from services.my_team_stats import MATCH_HISTORY_LIMIT, _load_map_name_by_uuid
+from services.player_profile import ROLE_LABELS, _load_ref_agents
+from services.round_phase_analysis import (
+    aggregate_round_phase,
+    analyze_rounds,
+    determine_team_color,
+    nearby_trade_deaths,
+    pct,
+    round_kill_events,
+)
+
+_DUELIST_LABEL = ROLE_LABELS["Duelist"]
+
+
+def _trade_tally(rounds: list, our_puuids: set[str], opp_puuids: set[str]) -> dict:
+    """라운드마다 우리 팀원이 죽을 때마다 nearby_trade_deaths로 "같은 교전에서 상대가
+    몇 명 같이 죽었는지"를 구해 1v1(상대 1명↑)/1v2(상대 2명↑) 트레이드 횟수를 센다 -
+    my_team_player_detail.py의 개인 트레이드 집계와 같은 정의를 팀 전체 사망에 적용."""
+    death_total = trade1v1 = trade1v2 = 0
+    for rnd in rounds:
+        kills = round_kill_events(rnd)
+        for k in kills:
+            if k.get("victim_puuid") not in our_puuids:
+                continue
+            death_total += 1
+            nearby = nearby_trade_deaths(kills, k, opp_puuids)
+            if nearby >= 1:
+                trade1v1 += 1
+            if nearby >= 2:
+                trade1v2 += 1
+    return {"deathTotal": death_total, "trade1v1": trade1v1, "trade1v2": trade1v2}
+
+
+def _death_locations_for_match(rounds: list, our_puuids: set[str], map_uuid: str | None) -> list[dict]:
+    """매치 하나의 모든 라운드에서 우리 팀 로스터가 사망한 위치 좌표(0~100 정규화) + puuid
+    리스트. round_detail_json에 rounds 원본이 그대로 저장돼 있어(services/match_history.py::
+    upsert_match_history 참고) Henrik의 kill_events[].victim_death_location을 꺼낼 수
+    있지만, 이건 게임 월드 좌표라 그대로는 미니맵 위에 못 찍는다 - services/map_coords_
+    service.py::normalize_location으로 변환한다. 맵별로 모아 선수별 최다 사망 위치
+    (히트맵)를 계산하는 재료로 쓴다(services/death_hotspot_service.py::
+    compute_player_hotspots). 변환 계수를 못 찾은 좌표(map_uuid가 없거나 신규/구버전
+    맵)는 조용히 스킵한다."""
+    locations: list[dict] = []
+    for rnd in rounds:
+        for k in round_kill_events(rnd):
+            puuid = k.get("victim_puuid")
+            if puuid in our_puuids:
+                loc = k.get("victim_death_location") or {}
+                if loc.get("x") is not None and loc.get("y") is not None:
+                    normalized = normalize_location(loc["x"], loc["y"], map_uuid=map_uuid)
+                    if normalized:
+                        locations.append({**normalized, "puuid": puuid})
+    return locations
+
+
+def _upsert_summary_row(
+    db: Session, team_id: str, stat_type: str, dimension_key: str, wins: int, losses: int, metrics: dict
+) -> None:
+    """(team_id, stat_type, dimension_key) 한 행을 원자적으로 upsert한다.
+
+    기존 "조회 후 없으면 add"(TOCTOU) 방식은, 같은 팀의 "팀 분석"/"AI 리포트" 탭을 거의
+    동시에 두 번 조회하면(병렬 요청) 두 세션이 동시에 "없음"을 보고 INSERT를 시도해
+    uq_team_stats 중복 키 IntegrityError가 났다(services/team_engagement_cache.py::
+    upsert_match_engagement와 같은 종류의 경합). MySQL 네이티브 INSERT ... ON DUPLICATE
+    KEY UPDATE로 바꿔 그 경합 자체를 없앤다."""
+    stmt = mysql_insert(TeamStatsSummary).values(
+        team_id=team_id, stat_type=stat_type, dimension_key=dimension_key,
+        wins=wins, losses=losses, metrics_json=metrics,
+    )
+    stmt = stmt.on_duplicate_key_update(
+        wins=stmt.inserted.wins, losses=stmt.inserted.losses, metrics_json=stmt.inserted.metrics_json,
+    )
+    db.execute(stmt)
+
+
+def _compute_and_cache(db: Session, team_id: str) -> None:
+    # services/my_team_stats.py와 동일한 이유(OR + ORDER BY가 round_detail_json까지
+    # 정렬 버퍼에 올려 "Out of sort memory"가 남)로 가벼운 컬럼만 먼저 조회하고
+    # round_detail_json은 정렬이 필요 없는 IN 조회로 별도로 채운다.
+    base_query = db.query(Match).options(defer(Match.round_detail_json))
+    matches_by_id = {
+        m.match_id: m
+        for m in (
+            base_query.filter(Match.team_a_id == team_id).all()
+            + base_query.filter(Match.team_b_id == team_id).all()
+        )
+    }
+    matches = sorted(matches_by_id.values(), key=lambda m: m.game_start or datetime.min, reverse=True)[
+        :MATCH_HISTORY_LIMIT
+    ]
+    match_ids = [m.match_id for m in matches]
+
+    detail_by_id: dict[str, list] = {}
+    if match_ids:
+        stmt = text("SELECT match_id, round_detail_json FROM matches WHERE match_id IN :ids").bindparams(
+            bindparam("ids", expanding=True)
+        )
+        for r in db.execute(stmt, {"ids": match_ids}).mappings().all():
+            raw = r["round_detail_json"]
+            parsed = json_module.loads(raw) if isinstance(raw, str) else raw
+            detail_by_id[r["match_id"]] = parsed if isinstance(parsed, list) else []
+
+    stats_rows = (
+        db.query(MatchPlayerStat).filter(MatchPlayerStat.match_id.in_(match_ids)).all() if match_ids else []
+    )
+    by_match: dict[str, list[MatchPlayerStat]] = {}
+    for s in stats_rows:
+        by_match.setdefault(s.match_id, []).append(s)
+
+    map_names = _load_map_name_by_uuid(db)
+    agents = _load_ref_agents(db)
+
+    # 선수별 "고정 열 순번" - 그 경기에 뛴 5명끼리만 puuid로 정렬하면, 서브 선수가 한
+    # 명만 들어와도(그 서브의 puuid가 주전들보다 사전순으로 앞서면) 주전 4명 전체가
+    # 한 칸씩 밀려버리는 문제가 있었다(예: 평소 A,B,C,D,E 순이었는데 E 대신 서브 F가
+    # 들어오면 F,A,B,C,D로 재정렬돼 A~D까지 다 밀림). 이를 막기 위해 "이 팀 최근
+    # MATCH_HISTORY_LIMIT경기 전체"에서 각 puuid가 몇 번 등장했는지 먼저 한 번만 세어
+    # 등장 횟수가 많은 순으로 고정 순번을 매긴다(동률이면 puuid로 안정적으로 타이브레이크).
+    # 이러면 주전(등장 횟수多)은 항상 앞쪽 고정 칸에 배치되고, 어쩌다 한 번 뛴 서브만
+    # 순번이 밀려 맨 뒤쪽 칸에 배치되어 주전들의 열은 흔들리지 않는다.
+    _appearance_count: dict[str, int] = {}
+    for _match_id in match_ids:
+        for _row in by_match.get(_match_id) or []:
+            if _row.team_id == team_id:
+                _appearance_count[_row.puuid] = _appearance_count.get(_row.puuid, 0) + 1
+    _player_rank = {
+        puuid: idx
+        for idx, puuid in enumerate(
+            sorted(_appearance_count, key=lambda p: (-_appearance_count[p], p))
+        )
+    }
+
+    all_records: list[dict] = []
+    trade_totals = {"deathTotal": 0, "trade1v1": 0, "trade1v2": 0}
+    our_duelist_acs: list[int] = []
+    opp_duelist_acs: list[int] = []
+    map_buckets: dict[str, dict] = {}
+
+    for match in matches:
+        rounds = detail_by_id.get(match.match_id)
+        if not rounds:
+            continue
+        roster = by_match.get(match.match_id) or []
+        # 위에서 계산한 _player_rank(등장 빈도 기준 고정 순번)로 정렬한다 - puuid 단독
+        # 정렬과 달리, 서브 선수가 끼어 있어도 주전들의 상대적 순서는 유지되고 서브만
+        # 뒤로 밀린다("요원 조합" 표에서 특정 경기만 순서가 어긋나던 문제의 원인).
+        our_rows = sorted(
+            (r for r in roster if r.team_id == team_id),
+            key=lambda r: (_player_rank.get(r.puuid, 10**9), r.puuid),
+        )
+        opp_rows = [r for r in roster if r.team_id != team_id]
+        if not our_rows:
+            continue
+        our_puuids = {r.puuid for r in our_rows}
+        opp_puuids = {r.puuid for r in opp_rows}
+
+        our_color = determine_team_color(rounds, our_puuids)
+        if our_color is None:
+            continue  # 방어적 스킵 - 이 매치는 공수/승패 판정 불가
+
+        records = analyze_rounds(rounds, our_color)
+        all_records.extend(records)
+
+        trade = _trade_tally(rounds, our_puuids, opp_puuids)
+        trade_totals["deathTotal"] += trade["deathTotal"]
+        trade_totals["trade1v1"] += trade["trade1v1"]
+        trade_totals["trade1v2"] += trade["trade1v2"]
+
+        for r in our_rows:
+            if r.role_type == _DUELIST_LABEL and r.acs is not None:
+                our_duelist_acs.append(r.acs)
+        for r in opp_rows:
+            if r.role_type == _DUELIST_LABEL and r.acs is not None:
+                opp_duelist_acs.append(r.acs)
+
+        # --- 맵별 집계 ---
+        map_uuid_key = (match.map_uuid or "").lower()
+        bucket = map_buckets.setdefault(map_uuid_key, {
+            "win": 0, "lose": 0,
+            "atk_w": 0, "atk_l": 0, "def_w": 0, "def_l": 0,
+            "site_counts": {}, "plant_times": [],
+            "combos": [], "players": {},
+            "death_locations": [],
+        })
+
+        is_team_a = match.team_a_id == team_id
+        our_rounds_won = (match.rounds_won_a if is_team_a else match.rounds_won_b) or 0
+        opp_rounds_won = (match.rounds_won_b if is_team_a else match.rounds_won_a) or 0
+        rounds_played = our_rounds_won + opp_rounds_won
+        result = "win" if match.winner_team_id == team_id else "lose"
+        bucket["win" if result == "win" else "lose"] += 1
+
+        for rec in records:
+            if rec["we_won"] is None:
+                continue
+            if rec["we_attacked"] is True:
+                bucket["atk_w" if rec["we_won"] else "atk_l"] += 1
+            elif rec["we_attacked"] is False:
+                bucket["def_w" if rec["we_won"] else "def_l"] += 1
+            if rec["plant_site"]:
+                bucket["site_counts"][rec["plant_site"]] = bucket["site_counts"].get(rec["plant_site"], 0) + 1
+            if rec["plant_time_ms"]:
+                try:
+                    bucket["plant_times"].append(int(rec["plant_time_ms"]))
+                except (TypeError, ValueError):
+                    pass
+
+        # 우리 로스터 사망 좌표 - 맵별로 누적해 히트맵 데이터로 쓴다. _death_locations_for_match 참고.
+        bucket["death_locations"].extend(_death_locations_for_match(rounds, our_puuids, match.map_uuid))
+
+        # our_rows가 이제 puuid 기준으로 정렬돼 있으므로, 여기서 만든 agent_names의 순서가
+        # 곧 "요원 조합" 표의 열 순서가 된다 - 로스터가 유지되는 한 매치가 바뀌어도 같은
+        # 선수(보통 같은 요원)가 항상 같은 열에 표시된다.
+        agent_names = [
+            (agents["by_uuid"].get((r.agent_uuid or "").lower()) or {}).get("name_ko") or "-"
+            for r in our_rows
+        ]
+        if len(agent_names) == 5:
+            bucket["combos"].append({"agents": agent_names, "result": result})
+
+        for r in our_rows:
+            pbucket = bucket["players"].setdefault(
+                r.puuid, {"name": None, "acs_sum": 0, "acs_n": 0, "fd_sum": 0, "rounds_sum": 0}
+            )
+            if r.acs is not None:
+                pbucket["acs_sum"] += r.acs
+                pbucket["acs_n"] += 1
+            pbucket["fd_sum"] += r.first_deaths or 0
+            pbucket["rounds_sum"] += rounds_played
+
+    # puuid -> riot_name (BEST/WORST 표시용)
+    all_puuids = {puuid for b in map_buckets.values() for puuid in b["players"]}
+    riot_names: dict[str, str] = {}
+    if all_puuids:
+        riot_names = {
+            r.puuid: r.riot_name
+            for r in db.query(RiotAccount).filter(RiotAccount.puuid.in_(all_puuids)).all()
+        }
+
+    # --- ① 라운드 정보(전체) 캐싱 ---
+    round_phase_metrics, overall_wins, overall_losses = aggregate_round_phase(all_records)
+    _upsert_summary_row(db, team_id, "round_phase", "overall", overall_wins, overall_losses, round_phase_metrics)
+
+    # --- ③ 교전 정보 캐싱 ---
+    our_duelist_avg = sum(our_duelist_acs) / len(our_duelist_acs) if our_duelist_acs else 0.0
+    opp_duelist_avg = sum(opp_duelist_acs) / len(opp_duelist_acs) if opp_duelist_acs else 0.0
+    matchup = _duelist_matchup_from_acs(our_duelist_avg, opp_duelist_avg)
+    death_total = trade_totals["deathTotal"]
+    engagement_metrics = {
+        "trade1v1": round(trade_totals["trade1v1"] / death_total * 100) if death_total else 0,
+        "trade1v2": round(trade_totals["trade1v2"] / death_total * 100) if death_total else 0,
+        "duelistVsDuelist": {"us": matchup["ourScore"], "them": matchup["theirScore"]},
+    }
+    _upsert_summary_row(db, team_id, "engagement", "overall", 0, 0, engagement_metrics)
+
+    # --- ② 맵 정보 캐싱 (맵당 1행) ---
+    for map_uuid_key, b in map_buckets.items():
+        games = b["win"] + b["lose"]
+        if games <= 0 or not map_uuid_key:
+            continue
+
+        total_plants = sum(b["site_counts"].values())
+        preferred_site = (
+            {site: round(cnt / total_plants * 100) for site, cnt in b["site_counts"].items()}
+            if total_plants
+            else {}
+        )
+        avg_plant_sec = round(sum(b["plant_times"]) / len(b["plant_times"]) / 1000) if b["plant_times"] else 0
+
+        # 요원 조합: 맵당 표본이 보통 1~2경기뿐이라 승률로 집계하면 0%/100%만 나와 의미가 없다.
+        # 조합을 묶지 않고 실제 치른 경기(최신순, matches와 동일한 정렬)를 그대로 한 줄씩 노출한다.
+        # 각 줄의 agents 배열은 위에서 puuid 정렬된 our_rows로 만들어졌으므로 열 순서가
+        # 매치 간에 일관된다.
+        game_combos = b["combos"]
+
+        player_summaries = []
+        for puuid, pb in b["players"].items():
+            avg_acs = round(pb["acs_sum"] / pb["acs_n"]) if pb["acs_n"] else 0
+            fd_rate = round(pb["fd_sum"] / pb["rounds_sum"] * 100) if pb["rounds_sum"] else 0
+            player_summaries.append({"name": riot_names.get(puuid, "-"), "acs": avg_acs, "fd": fd_rate})
+
+        best = max(player_summaries, key=lambda p: p["acs"], default=None)
+        remaining = [p for p in player_summaries if p is not best]
+        worst = max(remaining, key=lambda p: p["fd"], default=best)
+
+        # 팀원 사망 위치 분석(히트맵) - 로스터 5명 기준으로 선수당 대표 위치 1개씩만 뽑는다.
+        # compute_player_hotspots는 puuid만 알고 이름은 몰라 여기서 riot_names(위에서
+        # 이미 조회됨)로 이름을 붙인다.
+        death_hotspots = compute_player_hotspots(b["death_locations"])
+        for h in death_hotspots:
+            h["playerName"] = riot_names.get(h["playerId"], "-")
+
+        metrics = {
+            "mapName": map_names.get(map_uuid_key, "-"),
+            "mapWinRate": pct(b["win"], b["lose"]),
+            "atkWinRate": pct(b["atk_w"], b["atk_l"]),
+            "defWinRate": pct(b["def_w"], b["def_l"]),
+            "preferredSite": preferred_site,
+            "avgSpikePlantTime": avg_plant_sec,
+            "matchSample": games,
+            "combos": game_combos,
+            "comboAce": [{"name": best["name"], "acs": best["acs"]}] if best else [],
+            "comboWeakness": [{"name": worst["name"], "fd": worst["fd"], "acs": worst["acs"]}] if worst else [],
+            # 팀원 사망 위치 분석(히트맵) 섹션용 - 선수당 1개(최대 5개). _death_locations_for_match 참고.
+            "deathLocations": death_hotspots,
+        }
+        _upsert_summary_row(db, team_id, "map_side", map_uuid_key, b["win"], b["lose"], metrics)
+
+    db.commit()
+
+
+def build_my_team_analysis(db: Session, team_id: str) -> dict:
+    """캐시(team_stats_summary)가 있으면 그대로 읽고, 없으면(첫 진입) 계산해서 채운 뒤
+    읽는다.
+
+    _compute_and_cache는 한 팀당 여러 행(round_phase/engagement/맵별)을 한 트랜잭션
+    안에서 upsert한다 - 중복 키 에러는 원자적 upsert로 없어졌지만, 같은 팀을 두 세션이
+    거의 동시에 처음 계산하면(예: "팀 분석"과 "AI 리포트" 탭 동시 조회) 여러 행에 걸친
+    잠금 순서 차이로 데드락(OperationalError 1213)이 날 수 있다. 롤백 후 캐시를 다시
+    읽으면 대부분 이미 채워져 있어 재계산 없이 해결되고, 그래도 비어있으면 한 번 더
+    계산을 시도한다."""
+    rows = db.query(TeamStatsSummary).filter(TeamStatsSummary.team_id == team_id).all()
+    if not rows:
+        for attempt in range(2):
+            try:
+                _compute_and_cache(db, team_id)
+                break
+            except (IntegrityError, OperationalError):
+                db.rollback()
+                rows = db.query(TeamStatsSummary).filter(TeamStatsSummary.team_id == team_id).all()
+                if rows or attempt == 1:
+                    break
+        rows = db.query(TeamStatsSummary).filter(TeamStatsSummary.team_id == team_id).all()
+
+    round_info: dict = {}
+    engagement_info: dict | None = None
+    map_info: dict = {}
+
+    for row in rows:
+        if row.stat_type == "round_phase" and row.dimension_key == "overall":
+            round_info = row.metrics_json or {}
+        elif row.stat_type == "engagement" and row.dimension_key == "overall":
+            engagement_info = row.metrics_json or None
+        elif row.stat_type == "map_side":
+            metrics = dict(row.metrics_json or {})
+            map_name = metrics.pop("mapName", row.dimension_key)
+            map_info[map_name] = metrics
+
+    return {
+        "roundInfo": round_info,
+        "mapInfoByMap": map_info,
+        "engagementInfo": engagement_info,
+    }

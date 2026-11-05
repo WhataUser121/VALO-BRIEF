@@ -1,0 +1,623 @@
+"""
+Henrik 프리미어 팀 API 응답을 프론트 TeamProfilePage가 기대하는 형태로 가공.
+
+player_profile.py와 쌍을 이루는 팀 버전이지만 데이터 소스가 다르다 - 팀 매치 상세는
+get_match_detail(v2/match)로만 얻을 수 있고 건당 ~1.3MB로 무거워서(routers/teams.py에서
+asyncio.gather로 최근 N건만 동시에 불러옴), 여기서는 이미 받아온 match_details 리스트를
+가공만 한다(직접 API를 부르지 않음).
+
+season/act는 player_profile.py와 다르게 달력 기반 추정치를 쓴다 - v2/match의 season_id가
+개인 매치(stored-matches)처럼 "e11a5" 같은 짧은 코드가 아니라 순수 uuid라 그대로 못 쓰고,
+프론트 TeamProfilePage가 아직 쓰는 고정 SEASONS/ACTS 스킴(constants/seasons.js)에 맞춰뒀다.
+"""
+
+from datetime import datetime, timezone
+from sqlalchemy.orm import Session
+
+from services.death_hotspot_service import compute_player_hotspots
+from services.map_coords_service import normalize_location
+from services.player_profile import ROLE_LABELS, _load_ref_agents, _load_ref_maps
+from services.round_phase_analysis import aggregate_round_phase, analyze_rounds, determine_team_color
+
+# 매치 상세(v2/match) 1건이 ~1.3MB로 무거워서(실측), 최근 몇 건까지 불러올지 제한한다.
+# routers/teams.py(실제 조회)와 routers/search.py(존재확인 시 백그라운드 프리페치)가
+# 항상 같은 매치 집합을 캐시하도록 이 상수 하나를 공유해서 쓴다.
+MATCH_HISTORY_LIMIT = 10
+
+
+def resolve_team_icon_url(customization: dict) -> str | None:
+    """Henrik team-icon 엔드포인트(cdn.henrikdev.xyz)는 요청마다 아이콘+색상을 새로
+    합성해서 내려주고 캐싱 헤더가 전혀 없어 매번 ~1.7초씩 걸린다(실측). icon uuid+색상
+    조합이 같으면 항상 같은 이미지라, 원본 URL 대신 우리 프록시(routers/team_icon.py,
+    한 번 받으면 디스크에 캐싱해 재서빙)를 가리키는 상대경로를 돌려준다."""
+    icon = customization.get("icon")
+    if not icon:
+        return customization.get("image")
+    primary = (customization.get("primary") or "").lstrip("#")
+    secondary = (customization.get("secondary") or "").lstrip("#")
+    tertiary = (customization.get("tertiary") or "").lstrip("#")
+    return f"/api/team-icons/{icon}?primary={primary}&secondary={secondary}&tertiary={tertiary}"
+
+# 요원 조합(combos) 표시 순서 고정용. Henrik이 내려주는 roster 순서는 매치마다 들쭉날쭉해서
+# (참가 순서/내부 정렬 기준 불명) 같은 5인 조합이어도 경기마다 표시 순서가 달라 보이는 문제가
+# 있었다 - 화면(요원 조합 섹션)에서 항상 같은 순서로 보이도록 역할군 기준으로 정렬한다.
+# ROLE_LABELS(player_profile.py)와 같은 role_type 값 체계를 그대로 쓴다.
+_AGENT_ROLE_ORDER = {"duelist": 0, "initiator": 1, "controller": 2, "sentinel": 3}
+
+
+def _season_act_for(dt: datetime) -> tuple[str, str]:
+    """연도당 6개 Act(2개월씩)로 나누는 달력 기반 추정. player_profile.py의 진짜 Episode/Act
+    코드 방식과는 별개 - 팀 쪽엔 그런 코드가 없어서 어쩔 수 없이 쓰는 근사치."""
+    season = f"S{dt.year}"
+    act_index = (dt.month - 1) // 2
+    return season, f"Act {act_index + 1}"
+
+
+def _parse_datetime(value) -> datetime | None:
+    """game_start(epoch 초)를 로컬 시간대 datetime으로 파싱."""
+    if isinstance(value, (int, float)):
+        ts = value / 1000 if value > 1e12 else value
+        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
+    return None
+
+
+def _format_datetime(dt: datetime | None) -> tuple[str, str]:
+    """datetime을 화면 표시용 (날짜, 시간) 문자열 쌍으로 포맷."""
+    if dt is None:
+        return "-", "-"
+    return dt.strftime("%m.%d"), dt.strftime("%I:%M %p").lstrip("0")
+
+
+def _match_our_side(match: dict, team_name: str, team_tag: str) -> str | None:
+    """teams.red/blue 중 roster.name/tag가 조회 대상 팀과 일치하는 쪽을 "red"/"blue"로 반환.
+    일치하는 쪽이 없으면(다른 팀 매치가 섞여 들어온 경우 방어) None.
+
+    roster.get("name")도 strip() 처리한다 - Henrik roster.name에 공백이 붙은 팀이 실제로
+    있어(예: "XLA  ") 입력값만 strip하면 비교가 항상 실패한다(ml/engagement_predictor.py::
+    _team_roster의 동일 처리 참고)."""
+    teams = match.get("teams") or {}
+    name_l, tag_l = team_name.strip().lower(), team_tag.strip().lower()
+    for side in ("red", "blue"):
+        roster = (teams.get(side) or {}).get("roster") or {}
+        if str(roster.get("name", "")).strip().lower() == name_l and str(roster.get("tag", "")).strip().lower() == tag_l:
+            return side
+    return None
+
+
+def compute_round_phase_from_matches(match_details: list, team_name: str, team_tag: str) -> dict:
+    """라이브 match_details(v2/match raw dict 리스트)로 공격/수비/피스톨/에코 라운드
+    승률을 실제로 계산한다.
+
+    상대팀은 미가입일 수 있어 team_id가 없고 services/my_team_analysis.py의 DB 캐시
+    경로를 쓸 수 없다 - services/round_phase_analysis.py의 공유 계산 로직을 그대로 쓰되,
+    DB의 team_id 대신 이 매치의 roster.members(puuid 집합)로 "우리 팀"을 식별해 라이브로
+    돌린다. matches.round_detail_json이 곧 v2/match의 rounds 필드 그대로라
+    (services/match_history.py 참고) 입력 형태가 완전히 같다."""
+    all_records: list[dict] = []
+    for match in match_details:
+        if not match:
+            continue
+        side = _match_our_side(match, team_name, team_tag)
+        if side is None:
+            continue
+        rounds = match.get("rounds") or []
+        if not rounds:
+            continue
+        our_puuids = set(((match.get("teams") or {}).get(side) or {}).get("roster", {}).get("members") or [])
+        our_color = determine_team_color(rounds, our_puuids)
+        if our_color is None:
+            continue
+        all_records.extend(analyze_rounds(rounds, our_color))
+
+    metrics, _wins, _losses = aggregate_round_phase(all_records)
+    return metrics
+
+
+def _first_blood_count(match: dict, our_puuids: set[str]) -> int:
+    """라운드별로 가장 빠른 킬(kill_time_in_round 최소)의 킬러가 우리 로스터인 라운드 수."""
+    earliest: dict[int, dict] = {}
+    for k in match.get("kills") or []:
+        rnd = k.get("round")
+        if rnd is None:
+            continue
+        if rnd not in earliest or k.get("kill_time_in_round", 0) < earliest[rnd].get("kill_time_in_round", 0):
+            earliest[rnd] = k
+    return sum(1 for k in earliest.values() if k.get("killer_puuid") in our_puuids)
+
+
+def _first_death_counts(match: dict, our_puuids: set[str]) -> dict[str, int]:
+    """라운드별로 가장 빠른 킬(kill_time_in_round 최소)의 피살자(victim)가 우리 로스터면
+    그 선수의 선사망(first death) 카운트를 1 증가시킨다. _first_blood_count와 대칭 - 맵별
+    BEST(ACS 최고)/WORST(선사망률 최고) 선수 산출에 쓰인다."""
+    earliest: dict[int, dict] = {}
+    for k in match.get("kills") or []:
+        rnd = k.get("round")
+        if rnd is None:
+            continue
+        if rnd not in earliest or k.get("kill_time_in_round", 0) < earliest[rnd].get("kill_time_in_round", 0):
+            earliest[rnd] = k
+    counts: dict[str, int] = {}
+    for k in earliest.values():
+        victim = k.get("victim_puuid")
+        if victim in our_puuids:
+            counts[victim] = counts.get(victim, 0) + 1
+    return counts
+
+
+def _death_locations(match: dict, our_puuids: set[str], map_name_en: str) -> list[dict]:
+    """우리 팀 로스터가 사망한 위치 좌표(0~100 정규화) + puuid 리스트. 매치 하나 단위의
+    원본 포인트로, _map_info_by_map이 맵별로 모아 선수별 최다 사망 위치(히트맵)를
+    계산하는 재료로 쓴다(services/death_hotspot_service.py::compute_player_hotspots).
+    v2/match의 kills[].victim_death_location({x, y})은 게임 월드 좌표라 그대로는 미니맵
+    위에 못 찍는다 - services/map_coords_service.py::normalize_location으로 변환한다.
+    변환 계수를 못 찾은 좌표(신규/구버전 맵 등)는 조용히 스킵한다."""
+    locations = []
+    for k in match.get("kills") or []:
+        puuid = k.get("victim_puuid")
+        if puuid in our_puuids:
+            loc = k.get("victim_death_location") or {}
+            if loc.get("x") is not None and loc.get("y") is not None:
+                normalized = normalize_location(loc["x"], loc["y"], map_name_en=map_name_en)
+                if normalized:
+                    locations.append({**normalized, "puuid": puuid})
+    return locations
+
+
+def _sorted_roster_agents(characters: list[str], agents: dict) -> list[str]:
+    """rosterAgents(표시용 요원 리스트)를 역할군 기준으로 정렬. 같은 5인 조합이면 매치마다
+    항상 같은 순서로 나오게 하기 위함 - _AGENT_ROLE_ORDER 상단 주석 참고. 정렬 실패 원인이
+    되는 미확인 캐릭터명은 예외를 던지지 않고 맨 뒤로 보낸다(방어적 fallback).
+    .replace("/", "") - Henrik이 "KAY/O"처럼 슬래시 포함 이름을 주는데 ref_agents엔
+    "KAYO"로 저장돼 있어 소문자 변환만으로는 매칭이 안 된다(KAY/O 참가 매치에서
+    agent_uuid가 NULL로 저장되던 버그의 원인으로 실측 확인)."""
+    def sort_key(character: str) -> tuple[int, str]:
+        meta = agents["by_name"].get((character or "").lower().replace("/", "")) or {}
+        role_rank = _AGENT_ROLE_ORDER.get(meta.get("role_type"), 99)
+        return role_rank, character or ""
+
+    return sorted(characters, key=sort_key)
+
+
+def build_team_header(team_name: str, team_tag: str, team_info: dict) -> dict:
+    """team_info(get_premier_team 응답) 하나만으로 계산되는 필드 - 매치 상세 조회 불필요.
+    build_team_header/build_team_profile이 공유."""
+    stats = team_info.get("stats") or {}
+    placement = team_info.get("placement") or {}
+    customization = team_info.get("customization") or {}
+    matches_played = stats.get("matches") or 0
+    logo_image = resolve_team_icon_url(customization)
+    return {
+        "name": team_info.get("name") or team_name,
+        "tag": team_info.get("tag") or team_tag,
+        "division": f"디비전 {placement.get('division')}" if placement.get("division") is not None else "-",
+        "logoUrl": logo_image,
+        "ratingIconUrl": logo_image,
+        "recentSummary": {
+            "winRate": round((stats.get("wins") or 0) / matches_played * 100) if matches_played else 0,
+            "wins": stats.get("wins") or 0,
+            "losses": stats.get("losses") or 0,
+            "avgRoundWin": round((stats.get("rounds_won") or 0) / matches_played, 1) if matches_played else 0,
+            "avgRoundLose": round((stats.get("rounds_lost") or 0) / matches_played, 1) if matches_played else 0,
+        },
+    }
+
+
+def _parse_team_match(match: dict, team_name: str, team_tag: str, maps: dict, agents: dict):
+    """매치 1건(v2/match)을 팀 관점 Match Record + 우리 로스터 개인 스탯 리스트로 변환.
+    우리 팀 로스터를 못 찾으면 None."""
+    side = _match_our_side(match, team_name, team_tag)
+    if side is None:
+        return None
+    opp_side = "blue" if side == "red" else "red"
+
+    teams = match.get("teams") or {}
+    our_team = teams.get(side) or {}
+    opp_team = teams.get(opp_side) or {}
+    result = "win" if our_team.get("has_won") else "lose"
+    our_rounds = our_team.get("rounds_won") or 0
+    opp_rounds = opp_team.get("rounds_won") or 0
+    rounds_played = our_rounds + opp_rounds
+
+    metadata = match.get("metadata") or {}
+    map_name_en = metadata.get("map") or ""
+    map_ko = maps.get(map_name_en.lower(), map_name_en or "-")
+    started_at = _parse_datetime(metadata.get("game_start"))
+    date_str, time_str = _format_datetime(started_at)
+    season, act = _season_act_for(started_at) if started_at else ("-", "-")
+
+    our_puuids = set((our_team.get("roster") or {}).get("members") or [])
+    all_players = (match.get("players") or {}).get("all_players") or []
+    roster_stats = [p for p in all_players if p.get("puuid") in our_puuids]
+
+    def acs_of(p: dict) -> int:
+        score = (p.get("stats") or {}).get("score", 0)
+        return round(score / rounds_played) if rounds_played else 0
+
+    first_death_counts = _first_death_counts(match, our_puuids)
+    for p in roster_stats:
+        p["_match_acs"] = acs_of(p)
+        p["_match_adr"] = round((p.get("damage_made") or 0) / rounds_played) if rounds_played else 0
+        p["_match_first_death"] = first_death_counts.get(p.get("puuid"), 0)
+
+    kills = sum((p.get("stats") or {}).get("kills", 0) for p in roster_stats)
+    deaths = sum((p.get("stats") or {}).get("deaths", 0) for p in roster_stats)
+    assists = sum((p.get("stats") or {}).get("assists", 0) for p in roster_stats)
+    damage = sum(p.get("damage_made") or 0 for p in roster_stats)
+    acs_values = [acs_of(p) for p in roster_stats]
+
+    kda = round((kills + assists) / deaths, 2) if deaths else float(kills + assists)
+    adr = round(damage / len(roster_stats) / rounds_played) if roster_stats and rounds_played else None
+    acs = round(sum(acs_values) / len(acs_values)) if acs_values else None
+
+    mvp = None
+    mvp_player = max(roster_stats, key=lambda p: p.get("_match_acs", 0), default=None)
+    if mvp_player:
+        mstats = mvp_player.get("stats") or {}
+        shots = (mstats.get("headshots") or 0) + (mstats.get("bodyshots") or 0) + (mstats.get("legshots") or 0)
+        mkills, mdeaths, massists = mstats.get("kills", 0), mstats.get("deaths", 0), mstats.get("assists", 0)
+        # .replace("/", "") - _sorted_roster_agents 주석 참고(KAY/O 매칭 문제).
+        agent_meta = agents["by_name"].get((mvp_player.get("character") or "").lower().replace("/", ""))
+        agent_ko = (agent_meta or {}).get("name_ko") or mvp_player.get("character") or "-"
+        mvp = {
+            "agent": agent_ko,
+            "player": mvp_player.get("name") or "-",
+            "kda": round((mkills + massists) / mdeaths, 2) if mdeaths else float(mkills + massists),
+            "hs": round((mstats.get("headshots") or 0) / shots * 100) if shots else 0,
+            "acs": acs_of(mvp_player),
+        }
+
+    rounds = match.get("rounds") or []
+    pistol_indexes = [i for i in (0, 12) if i < len(rounds)]
+    pistol_won = sum(
+        1 for i in pistol_indexes
+        if (rounds[i].get("winning_team") or "").lower() == side
+    )
+
+    plant_site_counts: dict[str, int] = {}
+    plant_times: list[int] = []
+    for rnd in rounds:
+        plant = rnd.get("plant_events") or {}
+        planted_by = plant.get("planted_by") or {}
+        if planted_by.get("puuid") not in our_puuids:
+            continue
+        site = plant.get("plant_site")
+        if site:
+            plant_site_counts[site] = plant_site_counts.get(site, 0) + 1
+        raw_time = plant.get("plant_time_in_round")
+        if isinstance(raw_time, str):
+            raw_time = int(raw_time) if raw_time.isdigit() else None
+        if isinstance(raw_time, (int, float)) and raw_time > 0:
+            plant_times.append(int(raw_time))
+
+    player_stats = [
+        {
+            "puuid": p.get("puuid"),
+            "name": p.get("name") or "-",
+            "acs": p.get("_match_acs", 0),
+            "firstDeaths": p.get("_match_first_death", 0),
+            "roundsPlayed": rounds_played,
+        }
+        for p in roster_stats
+    ]
+
+    record = {
+        "map": map_ko,
+        "result": result,
+        "date": date_str,
+        "time": time_str,
+        "roundScore": f"{our_rounds}-{opp_rounds}",
+        "roundsWon": our_rounds,
+        "roundsLost": opp_rounds,
+        "kda": kda,
+        "adr": adr,
+        "acs": acs,
+        "firstBlood": _first_blood_count(match, our_puuids),
+        # 우리 로스터 사망 좌표 리스트 - 팀원 사망 위치 분석(히트맵) 섹션용. _death_locations 참고.
+        "deathLocations": _death_locations(match, our_puuids, map_name_en),
+        "mvp": mvp,
+        "season": season,
+        "act": act,
+        "pistolRoundsWon": pistol_won,
+        "pistolRoundsPlayed": len(pistol_indexes),
+        # 표시용 요원 리스트는 역할군 순서로 고정 정렬 - _sorted_roster_agents 참고.
+        # (roster_stats 자체의 순서는 개인 스탯 등 다른 필드가 의존하므로 그대로 둔다)
+        "rosterAgents": _sorted_roster_agents(
+            [p.get("character") for p in roster_stats], agents
+        ),
+        "plantSiteCounts": plant_site_counts,
+        "plantTimes": plant_times,
+        "playerStats": player_stats,
+    }
+    return record, roster_stats
+
+
+def _map_winrates(records: list) -> list:
+    buckets: dict[str, dict] = {}
+    for r in records:
+        bucket = buckets.setdefault(r["map"], {"map": r["map"], "win": 0, "lose": 0})
+        bucket["win" if r["result"] == "win" else "lose"] += 1
+    result = []
+    for b in buckets.values():
+        games = b["win"] + b["lose"]
+        if games > 0:
+            b["winRate"] = round(b["win"] / games * 100) if games else 0
+            result.append(b)
+    return result
+
+
+def _map_info_by_map(records: list, agents: dict) -> dict:
+    buckets: dict[str, dict] = {}
+    for r in records:
+        map_name = r["map"]
+        b = buckets.setdefault(
+            map_name,
+            {
+                "win": 0, "lose": 0, "games": 0, "combos": [], "plantSiteCounts": {}, "plantTimes": [],
+                "players": {}, "death_locations": [],
+            },
+        )
+        b["games"] += 1
+        b["win" if r["result"] == "win" else "lose"] += 1
+
+        for site, cnt in r.get("plantSiteCounts", {}).items():
+            b["plantSiteCounts"][site] = b["plantSiteCounts"].get(site, 0) + cnt
+        b["plantTimes"].extend(r.get("plantTimes", []))
+        b["death_locations"].extend(r.get("deathLocations", []))
+
+        for ps in r.get("playerStats", []):
+            puuid = ps.get("puuid")
+            if not puuid:
+                continue
+            pbucket = b["players"].setdefault(
+                puuid, {"name": ps.get("name") or "-", "acsSum": 0, "acsCount": 0, "firstDeaths": 0, "roundsPlayed": 0}
+            )
+            pbucket["name"] = ps.get("name") or pbucket["name"]
+            pbucket["acsSum"] += ps.get("acs", 0)
+            pbucket["acsCount"] += 1
+            pbucket["firstDeaths"] += ps.get("firstDeaths", 0)
+            pbucket["roundsPlayed"] += ps.get("roundsPlayed", 0)
+
+        # rosterAgents는 이미 _parse_team_match에서 역할군 순서로 정렬되어 들어온다.
+        # .replace("/", "") - _sorted_roster_agents 주석 참고(KAY/O 매칭 문제).
+        agent_names = []
+        for char in r.get("rosterAgents", []):
+            meta = agents["by_name"].get(char.lower().replace("/", ""))
+            agent_names.append((meta or {}).get("name_ko") or char)
+        if agent_names:
+            b["combos"].append({"agents": agent_names, "won": r["result"] == "win"})
+
+    result = {}
+    for map_name, b in buckets.items():
+        games = b["games"]
+        if games <= 0:
+            continue
+        win_rate = round(b["win"] / games * 100) if games else 0
+
+        total_plants = sum(b["plantSiteCounts"].values())
+        preferred_site = (
+            {site: round(cnt / total_plants * 100) for site, cnt in b["plantSiteCounts"].items()}
+            if total_plants > 0
+            else {"A": 0, "B": 0}
+        )
+
+        avg_plant_ms = round(sum(b["plantTimes"]) / len(b["plantTimes"])) if b["plantTimes"] else 0
+        avg_plant_sec = round(avg_plant_ms / 1000) if avg_plant_ms else 0
+
+        # 요원 조합: 맵당 표본이 보통 1~2경기뿐이라 승률로 집계하면 0%/100%만 나와 의미가 없다.
+        # 조합을 묶지 않고 실제 치른 경기(최신순, records와 동일한 정렬)를 그대로 한 줄씩 노출한다.
+        game_combos = [{"agents": c["agents"], "result": "win" if c["won"] else "lose"} for c in b["combos"]]
+
+        player_summaries = []
+        for pbucket in b["players"].values():
+            avg_acs = round(pbucket["acsSum"] / pbucket["acsCount"]) if pbucket["acsCount"] else 0
+            fd_rate = round(pbucket["firstDeaths"] / pbucket["roundsPlayed"] * 100) if pbucket["roundsPlayed"] else 0
+            player_summaries.append({"name": pbucket["name"], "acs": avg_acs, "fd": fd_rate})
+
+        best_player = max(player_summaries, key=lambda p: p["acs"], default=None)
+        worst_player = min(player_summaries, key=lambda p: p["acs"], default=None)
+
+        best_players = [{"name": best_player["name"], "acs": best_player["acs"]}] if best_player else []
+        worst_players = (
+            [{"name": worst_player["name"], "fd": worst_player["fd"], "acs": worst_player["acs"]}]
+            if worst_player else []
+        )
+
+        # 팀원 사망 위치 분석(히트맵) - 로스터 5명 기준으로 선수당 대표 위치 1개씩만 뽑는다.
+        # compute_player_hotspots는 puuid만 알고 이름은 몰라 여기서 b["players"](같은
+        # 루프에서 이미 채워짐)로 이름을 붙인다.
+        death_hotspots = compute_player_hotspots(b["death_locations"])
+        for h in death_hotspots:
+            h["playerName"] = (b["players"].get(h["playerId"]) or {}).get("name", "-")
+
+        result[map_name] = {
+            "mapWinRate": win_rate,
+            "sampleGames": games,
+            "attackWinRate": win_rate,
+            "defenseWinRate": win_rate,
+            "preferredSite": preferred_site,
+            "avgSpikePlantTime": f"{avg_plant_sec}초" if avg_plant_sec else "-",
+            "combos": game_combos,         # "요원 조합" 섹션에서 경기별 한 줄씩 사용
+            "comboAce": best_players,      # BEST 섹션에서 사용 (선수 1명)
+            "comboWeakness": worst_players, # WORST 섹션에서 사용 (선수 1명)
+            "deathLocations": death_hotspots,  # 팀원 사망 위치 분석 섹션 - 선수당 1개(최대 5개)
+        }
+    return result
+
+
+def _player_ranking(all_roster_stats: list, agents: dict, limit: int = 5) -> list:
+    buckets: dict[str, dict] = {}
+    for p in all_roster_stats:
+        puuid = p.get("puuid")
+        if not puuid:
+            continue
+        bucket = buckets.setdefault(puuid, {"name": p.get("name") or "-", "character": p.get("character") or "", "records": []})
+        bucket["records"].append(p)
+
+    ranked = []
+    for bucket in buckets.values():
+        records = bucket["records"]
+        n = len(records)
+        acs_values = [r.get("_match_acs", 0) for r in records]
+        adr_values = [r.get("_match_adr", 0) for r in records]
+        kills = sum((r.get("stats") or {}).get("kills", 0) for r in records)
+        deaths = sum((r.get("stats") or {}).get("deaths", 0) for r in records)
+        heads = sum((r.get("stats") or {}).get("headshots", 0) for r in records)
+        shots = sum(
+            (r.get("stats") or {}).get("headshots", 0)
+            + (r.get("stats") or {}).get("bodyshots", 0)
+            + (r.get("stats") or {}).get("legshots", 0)
+            for r in records
+        )
+        # .replace("/", "") - _sorted_roster_agents 주석 참고(KAY/O 매칭 문제).
+        agent_meta = agents["by_name"].get(bucket["character"].lower().replace("/", ""))
+        ranked.append({
+            "name": bucket["name"],
+            "acs": round(sum(acs_values) / n) if n else 0,
+            "adr": round(sum(adr_values) / n) if n else 0,
+            "hs": round(heads / shots * 100) if shots else 0,
+            "position": ROLE_LABELS.get((agent_meta or {}).get("role_type"), "-"),
+            "kd": round(kills / deaths, 2) if deaths else float(kills),
+        })
+
+    ranked.sort(key=lambda p: p["acs"], reverse=True)
+    for i, p in enumerate(ranked[:limit], start=1):
+        p["rank"] = i
+    return ranked[:limit]
+
+
+def build_team_profile(
+    db: Session,
+    *,
+    team_name: str,
+    team_tag: str,
+    team_info: dict,
+    match_details: list,
+) -> dict:
+    maps = _load_ref_maps(db)
+    agents = _load_ref_agents(db)
+
+    stats = team_info.get("stats") or {}
+    placement = team_info.get("placement") or {}
+    customization = team_info.get("customization") or {}
+    matches_played = stats.get("matches") or 0
+    logo_image = resolve_team_icon_url(customization)
+
+    records: list = []
+    all_roster_stats: list = []
+    act_index: dict[str, list] = {}
+    for match in match_details:
+        if not match:
+            continue
+        parsed = _parse_team_match(match, team_name, team_tag, maps, agents)
+        if parsed is None:
+            continue
+        record, roster_stats = parsed
+        records.append(record)
+        all_roster_stats.extend(roster_stats)
+        season, act = record["season"], record["act"]
+        if season != "-" and act != "-":
+            acts = act_index.setdefault(season, [])
+            if act not in acts:
+                acts.append(act)
+
+    act_options = [{"season": season, "acts": acts} for season, acts in act_index.items()]
+
+    # 팀 전체(5명 합산) 평균 KDA - 매치별 team-kda(_parse_team_match의 kda, 즉 5명
+    # 합산 kills+assists / 합산 deaths)를 조회된 매치 수만큼 평균낸다. 개인 KDA를
+    # 평균 내는 방식이 아니라 이미 팀 단위로 합산된 값의 평균이라 이중 평균이 아니다.
+    avg_kda = round(sum(r["kda"] for r in records) / len(records), 2) if records else 0
+
+    # 공격/수비/에코/피스톨/선취킬/선취死 승률은 전부 round_phase_analysis로 실제 계산한다
+    # (compute_round_phase_from_matches 참고). attackWinRate/defenseWinRate/atkWinRate/
+    # defWinRate 두 이름을 다 내려주는 이유: front/src/pages/MatchPredictionPage/index.jsx가
+    # 두 이름 다 폴백으로 읽는다.
+    round_phase = compute_round_phase_from_matches(match_details, team_name, team_tag)
+
+    return {
+        "name": team_info.get("name") or team_name,
+        "tag": team_info.get("tag") or team_tag,
+        "division": f"디비전 {placement.get('division')}" if placement.get("division") is not None else "-",
+        "logoUrl": logo_image,
+        "ratingIconUrl": logo_image,
+        "recentSummary": {
+            "winRate": round((stats.get("wins") or 0) / matches_played * 100) if matches_played else 0,
+            "wins": stats.get("wins") or 0,
+            "losses": stats.get("losses") or 0,
+            "avgRoundWin": round((stats.get("rounds_won") or 0) / matches_played, 1) if matches_played else 0,
+            "avgRoundLose": round((stats.get("rounds_lost") or 0) / matches_played, 1) if matches_played else 0,
+            "avgKda": avg_kda,
+        },
+        "playerRanking": _player_ranking(all_roster_stats, agents),
+        "mapWinrates": _map_winrates(records),
+        "mapInfoByMap": _map_info_by_map(records, agents),
+        "roundInfo": {
+            "attackWinRate": round_phase["atkWinRate"],
+            "defenseWinRate": round_phase["defWinRate"],
+            "atkWinRate": round_phase["atkWinRate"],
+            "defWinRate": round_phase["defWinRate"],
+            "pistolWinRate": round_phase["pistolWinRate"],
+            "ecoWinRate": round_phase["ecoWinRate"],
+            "fbWinRate": round_phase["fbWinPct"],
+            "fdLoseRate": round_phase["fdLosePct"],
+        },
+        "matchHistory": records,
+        "actOptions": act_options,
+    }
+
+
+QUICK_ANALYSIS_MATCH_LIMIT = 5
+
+
+def build_quick_analysis(
+    db: Session,
+    *,
+    team_name: str,
+    team_tag: str,
+    team_info: dict,
+    match_details: list,
+) -> dict:
+    maps = _load_ref_maps(db)
+    agents = _load_ref_agents(db)
+
+    records: list = []
+    all_roster_stats: list = []
+    for match in match_details:
+        if not match:
+            continue
+        parsed = _parse_team_match(match, team_name, team_tag, maps, agents)
+        if parsed is None:
+            continue
+        record, roster_stats = parsed
+        records.append(record)
+        all_roster_stats.extend(roster_stats)
+
+    games = len(records)
+    wins = sum(1 for r in records if r["result"] == "win")
+    losses = games - wins
+
+    # 팀 전체(5명 합산) 평균 KDA - build_team_profile과 동일한 방식(_parse_team_match의
+    # 매치별 team-kda를 games 건수만큼 평균).
+    avg_kda = round(sum(r["kda"] for r in records) / games, 2) if games else 0
+
+    placement = team_info.get("placement") or {}
+    customization = team_info.get("customization") or {}
+    logo_image = resolve_team_icon_url(customization)
+
+    return {
+        "teamName": team_info.get("name") or team_name,
+        "teamTag": team_info.get("tag") or team_tag,
+        "recentForm": [r["result"] for r in records],
+        "wins": wins,
+        "losses": losses,
+        "winRate": round(wins / games * 100) if games else 0,
+        "avgRoundWin": round(sum(r["roundsWon"] for r in records) / games, 1) if games else 0,
+        "avgRoundLose": round(sum(r["roundsLost"] for r in records) / games, 1) if games else 0,
+        "avgKda": avg_kda,
+        "playerRanking": _player_ranking(all_roster_stats, agents),
+        "tier": {
+            "division": f"디비전 {placement.get('division')}" if placement.get("division") is not None else "-",
+            "rp": placement.get("points") or 0,
+            "logoUrl": logo_image,
+            "iconUrl": logo_image,
+        },
+    }

@@ -1,0 +1,156 @@
+# Henrik API 기반 rolling feature
+
+from datetime import timedelta
+
+from sqlalchemy.orm import Session
+
+from ml.valorant_git import (
+    get_puuid_by_riot_id,
+    get_matches_v4,
+    get_match_detail_v4,
+    extract_player_rows_from_match
+)
+from services.player_rolling_cache import find_fresh_player_feature, upsert_player_feature
+from services.riot_accounts import find_riot_account
+from ml.team_feature import validate_player_feature
+
+REGION = "kr"
+PLATFORM = "pc"
+RECENT_MATCHES = 5
+
+# Rolling Feature(선수 최근 N경기 평균) 캐시 유효 시간. 경쟁전 한 판 평균 소요시간보다
+# 넉넉하게 잡아, 캐시 적중 시 Henrik 요청(선수당 puuid 1 + matches 1 + match detail
+# RECENT_MATCHES건 = 최대 6건)을 완전히 건너뛴다 - 승부예측_성능_분석.md 5번 참고.
+ROLLING_CACHE_TTL = timedelta(minutes=20)
+
+
+def resolve_puuid(name: str, tag: str, db: Session | None = None) -> str | None:
+    """Riot ID -> PUUID (캐시 재사용). 검색/프로필 조회 등에서 이미 riot_accounts에
+    캐싱된 선수라면 Henrik(v2/account) 호출 없이 그 puuid를 바로 쓴다. db가 없거나 캐시에
+    없는 선수라면 Henrik에 직접 물어본다 - 승부예측_성능_분석.md 5-1번 참고.
+
+    build_player_feature와 별도 함수로 뺀 이유(5-4번): predict_blue_win이 선수 10명을
+    ThreadPoolExecutor로 병렬 처리하는데, SQLAlchemy Session은 스레드-세이프하지 않다 -
+    그래서 db를 쓰는 이 단계는 병렬 구간 진입 "전"에 순차로 다 끝내고, puuid가 정해진
+    뒤부터(=이 함수 이후)만 병렬로 돌린다."""
+    cached = find_riot_account(db, name, tag) if db is not None else None
+    return cached.puuid if cached is not None else get_puuid_by_riot_id(name, tag)
+
+
+def get_cached_player_feature(db: Session | None, puuid: str) -> dict | None:
+    """player_rolling_cache에서 puuid의 Rolling Feature를 조회. ROLLING_CACHE_TTL
+    이내로 신선하면 build_player_feature와 동일한 형태의 dict를, 없거나 오래됐으면
+    None을 반환한다(호출부가 None이면 build_player_feature로 새로 계산).
+
+    resolve_puuid와 같은 이유로 build_player_feature 밖으로 뺐다: predict_blue_win이
+    puuid 10개를 ThreadPoolExecutor로 병렬 처리하기 "전"에, db를 쓰는 캐시 조회를
+    순차로 다 끝내야 한다(SQLAlchemy Session은 스레드-세이프하지 않음)."""
+    if db is None:
+        return None
+
+    feature = find_fresh_player_feature(db, puuid, ROLLING_CACHE_TTL)
+    try:
+        validate_player_feature(feature)
+    except ValueError:
+        return None
+    return feature
+
+
+def save_player_feature_cache(db: Session | None, feature: dict) -> None:
+    """build_player_feature가 Henrik에서 새로 계산한 feature 하나를 캐시에 저장.
+    get_cached_player_feature와 마찬가지로 병렬 구간이 끝난 뒤 순차로만 호출한다."""
+    if db is None:
+        return
+
+    validate_player_feature(feature)
+    upsert_player_feature(db, feature)
+
+
+def aggregate_player_rows(rows, puuid):
+    """동일한 경기 집합으로 모든 지표를 평균낸다. 결측 지표는 허용하지 않는다."""
+    if not rows:
+        raise ValueError(f"{puuid}: 유효한 최근 경기 없음")
+    columns = ("acs", "kd", "kast", "headshot_pct", "win")
+    features = ("recent_acs", "recent_kd", "recent_kast", "recent_headshot_pct", "recent_winrate")
+    for row in rows:
+        if row.get("puuid") != puuid:
+            raise ValueError("PUUID mismatch")
+        validate_player_feature({
+            # 요원 조합 피처는 가장 최근 경기의 요원만 사용한다.
+            "agent": rows[0].get("agent"),
+            **{feature: row.get(col) for col, feature in zip(columns, features)},
+        })
+    result = {"puuid": puuid, "agent": rows[0]["agent"]}
+    for col, feature in zip(columns, features):
+        result[feature] = round(sum(float(row[col]) for row in rows) / len(rows), 2)
+    validate_player_feature(result)
+    return result
+
+
+def build_player_feature(name: str, tag: str, db: Session | None = None, puuid: str | None = None):
+
+    # 1. Riot ID -> PUUID - puuid가 이미 주어졌으면(predict_blue_win이 병렬 구간 진입
+    # 전에 미리 resolve해둔 경우) 그대로 쓰고, 없으면 이 함수 안에서 직접 resolve한다
+    # (routers/predict.py의 저수준 테스트 엔드포인트, ml/test_predict.py 등 db 없이
+    # 단독으로 호출하는 경로용).
+    if puuid is None:
+        puuid = resolve_puuid(name, tag, db)
+
+    if puuid is None:
+        raise ValueError(f"{name}#{tag} PUUID 조회 실패")
+
+    # 디버그
+    # print(
+    #     f"\n[TARGET PLAYER] "
+    #     f"{name}#{tag} "
+    #     f"puuid={puuid}"
+    # )
+
+    # 2. 최근 5경기 - get_matches_v4(total_matches)는 항상 처음(start=0)부터 그 개수만큼의
+    # "원본" 매치를 준다(모드 무관). 그중 데스매치/팀 데스매치/에스컬레이션/5v5가 아닌 커스텀은
+    # extract_player_rows_from_match가 빈 리스트를 반환해 걸러지므로, 최근 5경기가 하필 전부
+    # 그런 모드면 유효 표본이 0~4개로 부족해질 수 있다(이 선수 하나 때문에 예측 전체가
+    # ValueError로 실패했던 원인). 부족하면 더 넓게(최대 3배) 훑어서 채운다 - get_match_detail_v4의
+    # _MATCH_DETAIL_CACHE 덕에 이미 받은 매치는 다시 네트워크를 안 탄다.
+    def _collect_rows(total_matches):
+        matches = get_matches_v4(REGION, PLATFORM, puuid, total_matches)
+        collected = []
+        for m in matches:
+            match_id = m["metadata"]["match_id"]
+            detail = get_match_detail_v4(REGION, match_id)
+            if detail is None:
+                continue
+            player_rows = extract_player_rows_from_match(detail, puuid)
+            target_row = next((row for row in player_rows if row.get("puuid") == puuid), None)
+            if target_row is not None:
+                collected.append(target_row)
+        return collected
+
+    rows = _collect_rows(RECENT_MATCHES)
+    if len(rows) < RECENT_MATCHES:
+        rows = _collect_rows(RECENT_MATCHES * 3)[:RECENT_MATCHES]
+
+    if len(rows) == 0:
+        raise ValueError(f"{name} 최근 경기 없음")
+
+    for row in rows:
+        if row.get("puuid") != puuid:
+            raise ValueError(
+                f"PUUID mismatch: "
+                f"target={puuid}, "
+                f"actual={row.get('puuid')}, "
+                f"match={row.get('match_id')}"
+            )
+
+    # 디버그
+    # print("[RECENT ROWS]")
+
+    # for row in rows:
+    #     print(
+    #         f"match={row.get('match_id')} "
+    #         f"puuid={row.get('puuid')} "
+    #         f"agent={row.get('agent')} "
+    #         f"acs={row.get('acs')}"
+    #     )
+
+    return aggregate_player_rows(rows, puuid)

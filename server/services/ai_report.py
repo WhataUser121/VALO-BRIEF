@@ -1,0 +1,533 @@
+"""
+"우리팀 분석 > AI 리포트" 탭 백엔드. AI_리포트_개발_설계.md 참고.
+
+DB에 이미 집계된 우리팀 통계(my_team_stats/my_team_analysis/my_team_players/
+my_team_player_detail)를 모아 Claude(Anthropic API)로 팀 전술 리포트를 생성한다 -
+아무것도 새로 계산하지 않고 다른 탭이 이미 만든 숫자를 프롬프트 재료로만 쓴다
+(다른 탭과 항상 같은 숫자를 보장하기 위함). 응답 JSON 스키마(intro/strengths/
+weaknesses/tactic/playerFeedback, 각 stat/title/detail 구조)는 _build_prompt의
+system_prompt에 정의돼 있다.
+
+결과는 insights 테이블에 문장 단위로 저장한다. 같은 팀으로 재조회하면 새 매치가 안
+쌓인 이상 이 캐시를 그대로 재사용해 Claude를 다시 부르지 않는다(비용/레이턴시 문제,
+AI_리포트_개발_설계.md 5번). 프롬프트를 바꿀 때마다 scripts/clear_ai_cache.py로
+캐시를 지워야 새 스키마가 반영된다 - scripts/preview_ai_report.py로 캐시/브라우저
+없이 먼저 결과를 확인할 수 있다.
+
+ANTHROPIC_API_KEY가 없거나 호출/파싱이 실패하면 서버가 죽지 않고 결정론적 템플릿
+리포트로 대체한다(ml/engagement_predictor.py의 "학습 전 heuristic-v0" 폴백과
+같은 철학 - AI_리포트_개발_설계.md 6번).
+"""
+import asyncio
+import json
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+from models.insight import Insight
+from models.match import Match
+from models.team import Team
+from services import my_team_analysis, my_team_player_detail, my_team_players, my_team_stats
+from services.claude_client import generate_with_retry
+
+# tactic 항목 개수 범위(우선순위 높은 순서로 2~3개).
+TACTIC_MIN_ITEMS = 2
+TACTIC_MAX_ITEMS = 3
+
+_KST = timezone(timedelta(hours=9))
+
+
+def _now_kst() -> datetime:
+    return datetime.now(_KST).replace(tzinfo=None)
+
+
+def _latest_match_at(db: Session, team_id: str) -> datetime | None:
+    """이 팀이 참가한 매치 중 가장 최근 game_start. 캐시 신선도 판정용
+    (AI_리포트_개발_설계.md 5번 "매치 기반" 기준)."""
+    row = (
+        db.query(Match.game_start)
+        .filter(or_(Match.team_a_id == team_id, Match.team_b_id == team_id))
+        .filter(Match.game_start.isnot(None))
+        .order_by(Match.game_start.desc())
+        .first()
+    )
+    return row[0] if row else None
+
+
+def _normalize_item(data: dict) -> dict:
+    """{stat,title,detail} 형태 dict를 프론트 계약 shape으로 정규화. detail이
+    문자열(구버전 캐시)이면 1개짜리 리스트로 감싼다. _decode_item과 _decode_tactic이
+    공통으로 쓴다."""
+    detail = data.get("detail")
+    if isinstance(detail, str):
+        detail = [detail] if detail else []
+    elif not isinstance(detail, list):
+        detail = []
+    return {
+        "stat": data.get("stat", "") or "",
+        "title": data.get("title", "") or "",
+        "detail": detail,
+    }
+
+
+def _encode_item(item: dict) -> str:
+    """strength/weakness 구조화 항목({stat,title,detail})을 insights.content(문자열
+    컬럼)에 저장하기 위해 JSON으로 인코딩."""
+    return json.dumps(item, ensure_ascii=False)
+
+
+def _decode_item(content: str) -> dict:
+    """strength/weakness 항목 디코딩. 파싱 실패(구조화 이전 구버전 캐시)면 content
+    전체를 detail 1개짜리 항목으로 감싸 폴백한다."""
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict) and "detail" in data:
+            return _normalize_item(data)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {"stat": "", "title": "", "detail": [content] if content else []}
+
+
+def _encode_tactic(items: list[dict]) -> str:
+    """tactic 리스트({stat,title,detail} 항목 2~3개)를 JSON으로 인코딩."""
+    return json.dumps(items, ensure_ascii=False)
+
+
+def _decode_tactic(content: str) -> list[dict]:
+    """tactic 디코딩. 구조화 이전엔 tactic이 통문단 문자열이었다(레거시 캐시 호환) -
+    JSON 리스트 파싱이 안 되거나 빈 리스트면 그 문단 전체를 detail 1개짜리 항목 하나로
+    감싸 호환한다."""
+    try:
+        data = json.loads(content)
+        if isinstance(data, list):
+            items = [_normalize_item(e) for e in data if isinstance(e, dict)]
+            if items:
+                return items
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return [{"stat": "", "title": "", "detail": [content]}] if content else []
+
+
+def _rows_to_report(rows: list[Insight], roster: list[dict]) -> tuple[dict | None, str]:
+    """insights 행들을 프론트 계약 shape으로 재조립. 이전 생성이 중간에 끊겨
+    불완전하면(예: 서버 재시작으로 저장 도중 실패) None을 반환해 재생성을 유도한다.
+    (report, source) 반환 - source는 "claude"/"fallback"/"unknown"(마커 행이 없던
+    구버전 캐시 - 9-8번 참고, _read_cached_report가 신선도 판정에 씀)."""
+    intro = None
+    tactic: list[dict] = []
+    strengths: list[dict] = []
+    weaknesses: list[dict] = []
+    player_texts: dict[str, dict] = {}
+    source = "unknown"
+
+    for r in rows:
+        if r.target_type == "team":
+            if r.insight_type == "summary":
+                intro = r.content
+            elif r.insight_type == "strength":
+                strengths.append(_decode_item(r.content))
+            elif r.insight_type == "weakness":
+                weaknesses.append(_decode_item(r.content))
+            elif r.insight_type == "strategy":
+                tactic = _decode_tactic(r.content)
+            elif r.insight_type == "source":
+                source = r.content
+        elif r.target_type == "player" and r.target_puuid:
+            entry = player_texts.setdefault(r.target_puuid, {})
+            if r.insight_type in ("strength", "weakness"):
+                entry[r.insight_type] = _decode_item(r.content)
+
+    if not intro or not tactic or len(strengths) < 3 or len(weaknesses) < 3:
+        return None, source
+
+    player_feedback = []
+    for p in roster:
+        texts = player_texts.get(p["id"])
+        if not texts:
+            continue
+        player_feedback.append({
+            "name": p["name"],
+            "role": p.get("role") or "-",
+            "acs": p.get("acs", 0),
+            "avatarUrl": p.get("avatarUrl"),
+            "strength": texts.get("strength") or {"stat": "", "title": "", "detail": []},
+            "weakness": texts.get("weakness") or {"stat": "", "title": "", "detail": []},
+        })
+
+    if not player_feedback:
+        return None, source
+
+    return {
+        "intro": intro,
+        "strengths": strengths[:3],
+        "weaknesses": weaknesses[:3],
+        "tactic": tactic[:TACTIC_MAX_ITEMS],
+        "playerFeedback": player_feedback,
+    }, source
+
+
+def _read_cached_report(db: Session, team_id: str, roster: list[dict]) -> tuple[dict | None, datetime | None, str]:
+    rows = (
+        db.query(Insight)
+        .filter(Insight.team_id == team_id, Insight.opponent_team_id.is_(None))
+        .all()
+    )
+    if not rows:
+        return None, None, "unknown"
+    generated_at = max((r.generated_at for r in rows), default=None)
+    report, source = _rows_to_report(rows, roster)
+    return report, generated_at, source
+
+
+def _save_report(db: Session, team_id: str, report: dict, roster: list[dict], source: str) -> None:
+    """이 팀의 기존 팀-리포트 행(opponent_team_id IS NULL)을 전부 지우고 새로 채운다 -
+    upsert 키가 없는 문장 단위 테이블이라 "통째로 교체"가 가장 단순하고 안전하다.
+    source("claude"/"fallback")는 별도 마커 행으로 같이 저장 - Claude가 일시적으로
+    실패해서 폴백이 캐시됐을 뿐인데 그걸 "정상 생성된 리포트"로 착각해 계속 재사용하는
+    것을 막기 위함(9-8번 참고). strength/weakness 계열 항목은 _encode_item으로,
+    tactic 리스트는 _encode_tactic으로 JSON 인코딩해 content에 저장한다."""
+    db.query(Insight).filter(Insight.team_id == team_id, Insight.opponent_team_id.is_(None)).delete()
+
+    now = _now_kst()
+    rows = [Insight(team_id=team_id, target_type="team", insight_type="summary",
+                     content=report["intro"], generated_at=now)]
+    rows += [Insight(team_id=team_id, target_type="team", insight_type="strength",
+                      content=_encode_item(s), generated_at=now) for s in report["strengths"]]
+    rows += [Insight(team_id=team_id, target_type="team", insight_type="weakness",
+                      content=_encode_item(w), generated_at=now) for w in report["weaknesses"]]
+    rows.append(Insight(team_id=team_id, target_type="team", insight_type="strategy",
+                         content=_encode_tactic(report["tactic"]), generated_at=now))
+    rows.append(Insight(team_id=team_id, target_type="team", insight_type="source",
+                         content=source, generated_at=now))
+
+    name_to_puuid = {p["name"]: p["id"] for p in roster}
+    for fb in report["playerFeedback"]:
+        puuid = name_to_puuid.get(fb["name"])
+        if not puuid:
+            continue
+        rows.append(Insight(team_id=team_id, target_type="player", target_puuid=puuid,
+                             insight_type="strength", content=_encode_item(fb["strength"]), generated_at=now))
+        rows.append(Insight(team_id=team_id, target_type="player", target_puuid=puuid,
+                             insight_type="weakness", content=_encode_item(fb["weakness"]), generated_at=now))
+
+    db.add_all(rows)
+    db.commit()
+
+
+def _collect_team_context(db: Session, team: Team) -> dict:
+    """3번 Step 1~2 - 다른 탭이 이미 계산해둔 결과만 모은다(재계산 없음)."""
+    return {
+        "stats": my_team_stats.build_my_team_stats(db, team),
+        "analysis": my_team_analysis.build_my_team_analysis(db, team.team_id),
+    }
+
+
+async def _collect_roster_with_detail(db: Session, team: Team) -> tuple[list[dict], dict[str, dict]]:
+    roster = await my_team_players.build_my_team_players(db, team)
+    details = {
+        p["id"]: my_team_player_detail.build_my_team_player_detail(db, team.team_id, p["id"])
+        for p in roster
+    }
+    return roster, details
+
+
+def _build_prompt(context: dict, roster: list[dict], details: dict[str, dict]) -> tuple[str, str]:
+    """(system_prompt, user_prompt) - AI_리포트_개발_설계.md 4-2번.
+
+    strengths/weaknesses/tactic/playerFeedback.strength/weakness는 {stat,title,
+    detail} 객체다(tactic만 리스트 길이가 2~3개). detail은 개조식 구 1~2개짜리
+    문자열 배열 - 프론트가 각 원소를 별도 줄로 렌더링한다. intro는 유일하게 자유
+    문단이지만, 문장당 수치를 몰아넣지 말라는 제약을 둔다."""
+    team_name = context["stats"].get("name") or "우리 팀"
+    system_prompt = (
+        "너는 발로란트 프리미어 팀 전술 분석가다. 아래 사용자 메시지에 주어진 통계만 "
+        "근거로 한국어로 분석하고, 반드시 다음 JSON 스키마와 정확히 일치하는 JSON 객체 "
+        "하나만 응답하라(스키마 밖 텍스트/설명/마크다운 금지):\n"
+        "{\n"
+        '  "intro": string,               // 팀 전반 요약 2~3문장\n'
+        '  "strengths": [                 // 팀 강점 정확히 3개\n'
+        '    {"stat": string, "title": string, "detail": string[]}\n'
+        "  ],\n"
+        '  "weaknesses": [                // 팀 약점 정확히 3개, 형식 동일\n'
+        '    {"stat": string, "title": string, "detail": string[]}\n'
+        "  ],\n"
+        f'  "tactic": [                    // 전술 제안, 우선순위 높은 순서로 '
+        f'{TACTIC_MIN_ITEMS}~{TACTIC_MAX_ITEMS}개\n'
+        '    {"stat": string, "title": string, "detail": string[]}\n'
+        "  ],\n"
+        '  "playerFeedback": [            // 아래 로스터 전원, 각 1개씩\n'
+        "    {\n"
+        '      "id": string,\n'
+        '      "strength": {"stat": string, "title": string, "detail": string[]},\n'
+        '      "weakness": {"stat": string, "title": string, "detail": string[]}\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "intro 작성 규칙:\n"
+        "- 2~3문장. 한 문장에 수치를 3개 이상 몰아넣거나 괄호 안에 여러 항목을 "
+        '나열하지 마라.\n'
+        "나쁜 예(하지 마라): \"맵별 편차가 극심하여(브리즈 100% vs 펄·프랙처·선셋 "
+        '0%) 일관성 있는 전술 운영이 필요하다\" → 괄호 안에 수치 3개를 몰아넣었다.\n'
+        "좋은 예: \"맵별 편차가 매우 크다\" (구체적 맵 이름·수치 나열은 strengths/"
+        "weaknesses/playerFeedback에서 이미 다루므로 intro에서는 전체 인상만 "
+        "짧게 전달해라).\n"
+        "strengths/weaknesses의 각 항목, tactic의 각 항목, playerFeedback의 "
+        "strength/weakness는 모두 stat/title/detail 세 필드로 나눠서 쓰고, 각각 "
+        "아래 규칙을 지켜라:\n"
+        "- stat: 근거가 되는 핵심 수치나 요약값 하나만, 5자 내외로 아주 짧게(예: "
+        '"68%", "4개 맵 0승"). 여러 수치를 나열하지 마라. strengths/weaknesses와 '
+        "playerFeedback의 strength/weakness는 예외 없이 stat을 채워야 한다 - "
+        "약점(weakness)이라고 해서 stat을 비우지 마라. 여러 맵을 나열하는 약점이라도 "
+        "그 맵들에서의 승률/성공률처럼 근거가 되는 수치를 반드시 찾아 채워라(예: "
+        '"어비스·프랙처 저조 성적"이라는 약점이라면 그 두 맵의 평균 승률이나 가장 '
+        '낮은 수치를 stat으로). stat을 빈 문자열("")로 두는 것은 tactic 항목 '
+        "중에서 정말로 뒷받침할 단일 수치가 없을 때만 허용되는 예외다.\n"
+        "- title: 그 항목이 무엇에 대한 것인지 5~12자 내외 명사구만(예: \"선취킬 후 "
+        '라운드 승리율\", \"에코 라운드 대응 강화\"). 숫자를 title에 넣지 마라.\n'
+        "- detail: 정확히 1~2개의 짧은 구로 이루어진 문자열 배열. 각 구는 6~14자 "
+        "내외이며 반드시 보고서식 개조식으로 끝내라 - 명사형이나 어간+'ㅁ/음'으로 "
+        '끝내고("~부족", "~필요", "~시급", "~우수", "~흔들림"), "~다/~한다/~하다/'
+        '~합니다"로 끝나는 완결형 문장은 절대 쓰지 마라. stat에 쓴 수치나 그와 동일한 '
+        "의미의 표현(퍼센트, 비율, 배수, 순위 등 어떤 형태로든)을 detail 안에서 절대 "
+        "다시 쓰지 마라 - stat과 detail은 서로 다른 정보를 담아야 한다(stat=얼마나, "
+        "detail=왜/무슨 의미). 구가 2개면 원인→제안, 상황→결과처럼 자연스러운 의미 "
+        "단위로 끊어라.\n"
+        "나쁜 예(하지 마라): {\"stat\": \"70%\", \"title\": \"선취 실점 후 방어\", "
+        '"detail": ["70%의 높은 패배율을 기록하여 수비 열세 상황 극복 능력이 부족하고 '
+        '경기 후반부에 심화될 가능성이 크다"]} → 완결형 문장, 숫자 반복, 한 구가 너무 '
+        "길다.\n"
+        "좋은 예: {\"stat\": \"70%\", \"title\": \"선취 실점 후 방어\", \"detail\": "
+        '["선취점 허용 시 급격히 흔들림", "수비 조직력 재정비 필요"]}\n'
+        "tactic 항목 좋은 예: {\"stat\": \"\", \"title\": \"약세 맵 수비 원칙 이식\", "
+        '"detail": ["브리즈 성공 패턴 분석", "취약 맵에 조직력 적용"]}\n'
+        f"playerFeedback는 반드시 아래 로스터의 {len(roster)}명 전원에 대해, 나열된 id를 "
+        "그대로 사용해 정확히 하나씩만 작성하라. "
+        f'이 팀의 정식 이름은 "{team_name}"이다 - intro에서 팀을 가리킬 때는 항상 '
+        f'이름 뒤에 "팀"을 붙여서 써라(예: "{team_name} 팀은 ...", "{team_name} 팀의 '
+        '..." - 빈 괄호나 플레이스홀더 없이, "팀" 없이 이름만 쓰지도 말 것). '
+        "title/detail은 명사구/개조식이라 팀 이름을 넣지 않아도 된다.\n"
+        'intro 안에서 로스터의 특정 선수 이름을 언급할 때도 마찬가지로 이름 뒤에 '
+        '"선수"를 붙여서 써라(예: "duk3 선수는 ...", "SacR1ficE 선수의 ..." - 이름만 '
+        "단독으로 쓰지 말 것). playerFeedback은 name/role 필드가 이미 따로 있으니 그 "
+        "안의 strength/weakness에서는 이름을 반복해서 부르지 않아도 된다.\n"
+        "숫자 사용 규칙(stat 필드도 포함해 intro/title/detail 전부에 예외 없이 적용):\n"
+        "- 절대 쓰면 안 되는 것: ACS, K/D나 KD 비율(예: \"1.05\", \"0.71\", \"5.0 KD\"), "
+        "ADR, 킬/데스/어시스트 개수. 사용자 메시지에 [선수별 상세]로 준 JSON 안의 atkKd/"
+        "defKd/ecoKd/pistolKd/weapons[].kd 같은 필드들도 전부 이 KD 비율에 해당하니 "
+        "본문에 그 숫자를 그대로 절대 인용하지 마라 - 크고 작음(높다/낮다/우수하다/"
+        "부족하다) 같은 정성적 서술로만 표현해라.\n"
+        "- 써도 되는 것: 승률/성공률/헤드샷 비율처럼 %(퍼센트)로 표현되는 값과, 순수 "
+        '개수 표현(예: "4개 맵", "0승")뿐이다.\n'
+        "이 규칙을 지키는 이유: ACS/KD/ADR 같은 원본 수치는 이미 다른 탭(팀 분석/개인 "
+        "분석)에 표로 나와 있어 여기서 또 반복할 필요가 없다."
+    )
+
+    roster_lines = "\n".join(
+        f"- id={p['id']} 이름={p['name']} role={p.get('role')} ACS={p.get('acs')} "
+        f"KD={p.get('kd')} HS%={p.get('hs')} ADR={p.get('adr')} 주요요원={p.get('mostAgent')}"
+        for p in roster
+    )
+    user_prompt = (
+        f"[팀 이름]\n{team_name}\n\n"
+        f"[팀 최근 폼]\n{json.dumps(context['stats'].get('recentSummary'), ensure_ascii=False)}\n\n"
+        f"[선수 랭킹(ACS 상위)]\n{json.dumps(context['stats'].get('playerRanking'), ensure_ascii=False)}\n\n"
+        f"[맵별 승률]\n{json.dumps(context['stats'].get('mapWinrates'), ensure_ascii=False)}\n\n"
+        f"[라운드 페이즈 통계(공격/수비/피스톨/에코 승률, 선취킬/선취死 이후 라운드 결과율)]\n"
+        f"{json.dumps(context['analysis'].get('roundInfo'), ensure_ascii=False)}\n\n"
+        f"[교전 통계(1대1/1대2 클러치 성공률, 듀얼리스트 매치업)]\n"
+        f"{json.dumps(context['analysis'].get('engagementInfo'), ensure_ascii=False)}\n\n"
+        f"[맵별 상세(선호 사이트, 조합, 강점/약점 선수 등)]\n"
+        f"{json.dumps(context['analysis'].get('mapInfoByMap'), ensure_ascii=False)}\n\n"
+        f"[로스터]\n{roster_lines}\n\n"
+        f"[선수별 상세(맵별 지표, 조준, 클러치, 교전)]\n{json.dumps(details, ensure_ascii=False)}"
+    )
+    return system_prompt, user_prompt
+
+
+def _validate_stat_item(item, label: str) -> dict:
+    """strengths/weaknesses/tactic/playerFeedback.strength/weakness 공통 shape
+    검증({stat,title,detail} - stat은 비어 있어도 되지만 title과 detail은 필수).
+    detail은 1~2개의 비어있지 않은 문자열로 이루어진 배열이어야 한다."""
+    if not isinstance(item, dict):
+        raise ValueError(f"{label}은 객체({{stat,title,detail}})여야 함")
+    if not isinstance(item.get("stat"), str):
+        raise ValueError(f"{label}.stat 누락/타입 오류")
+    if not isinstance(item.get("title"), str) or not item["title"].strip():
+        raise ValueError(f"{label}.title 누락/빈 값")
+
+    detail = item.get("detail")
+    if (
+        not isinstance(detail, list)
+        or not (1 <= len(detail) <= 2)
+        or not all(isinstance(d, str) and d.strip() for d in detail)
+    ):
+        raise ValueError(f"{label}.detail은 1~2개의 비어있지 않은 문자열 배열이어야 함")
+
+    return {
+        "stat": item["stat"].strip(),
+        "title": item["title"].strip(),
+        "detail": [d.strip() for d in detail],
+    }
+
+
+def _parse_and_validate(raw_json: str, roster: list[dict]) -> dict:
+    """2번 스키마와 일치하는지 확인 - 어긋나면 ValueError(호출부가 폴백으로 전환).
+    strengths/weaknesses/tactic/playerFeedback.strength/weakness는 {stat,title,
+    detail} 구조를 각각 _validate_stat_item으로 검증한다."""
+    data = json.loads(raw_json)
+
+    if not isinstance(data.get("intro"), str) or not data["intro"].strip():
+        raise ValueError("intro 누락/빈 값")
+
+    # 3개 미만이면 재시도하지만, 4개 이상은 통째로 재시도하는 대신 앞 3개만 잘라 쓴다 -
+    # Claude 호출 한 번이 20초 안팎이라(2026-09-12 실측, opponent_ai_report.py와 동일
+    # 파이프라인 공유) "거의 맞는" 응답 때문에 그 20초를 또 태우는 낭비를 없앤다.
+    raw_strengths = data.get("strengths") or []
+    raw_weaknesses = data.get("weaknesses") or []
+    if len(raw_strengths) < 3:
+        raise ValueError(f"strengths는 최소 3개여야 함 (받음: {len(raw_strengths)}개)")
+    if len(raw_weaknesses) < 3:
+        raise ValueError(f"weaknesses는 최소 3개여야 함 (받음: {len(raw_weaknesses)}개)")
+    strengths = [_validate_stat_item(s, f"strengths[{i}]") for i, s in enumerate(raw_strengths[:3])]
+    weaknesses = [_validate_stat_item(w, f"weaknesses[{i}]") for i, w in enumerate(raw_weaknesses[:3])]
+
+    raw_tactic = data.get("tactic") or []
+    if not (TACTIC_MIN_ITEMS <= len(raw_tactic) <= TACTIC_MAX_ITEMS):
+        raise ValueError(
+            f"tactic은 {TACTIC_MIN_ITEMS}~{TACTIC_MAX_ITEMS}개여야 함 (받음: {len(raw_tactic)}개)"
+        )
+    tactic = [_validate_stat_item(t, f"tactic[{i}]") for i, t in enumerate(raw_tactic)]
+
+    feedback_by_id = {f.get("id"): f for f in (data.get("playerFeedback") or [])}
+    player_feedback = []
+    for p in roster:
+        fb = feedback_by_id.get(p["id"])
+        if not fb:
+            raise ValueError(f"playerFeedback에 로스터 id={p['id']}({p['name']}) 누락")
+        strength = _validate_stat_item(fb.get("strength"), f"playerFeedback[{p['id']}].strength")
+        weakness = _validate_stat_item(fb.get("weakness"), f"playerFeedback[{p['id']}].weakness")
+        player_feedback.append({
+            "name": p["name"],
+            "role": p.get("role") or "-",
+            "acs": p.get("acs", 0),
+            "avatarUrl": p.get("avatarUrl"),
+            "strength": strength,
+            "weakness": weakness,
+        })
+
+    return {
+        "intro": data["intro"],
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "tactic": tactic,
+        "playerFeedback": player_feedback,
+    }
+
+
+def _pct(value) -> str:
+    return f"{value}%" if isinstance(value, (int, float)) else "정보 없음"
+
+
+def _fallback_report(context: dict, roster: list[dict]) -> dict:
+    """Claude 미설정/호출 실패/파싱 실패 시 결정론적 템플릿(6번 - 실제 숫자는 채우되
+    문장은 규칙 기반으로 조립). ml/engagement_predictor.py의 heuristic-v0와 같은 철학.
+    strengths/weaknesses/tactic/playerFeedback.strength/weakness도 Claude 경로와
+    동일하게 {stat,title,detail(list)} shape과 개조식 톤으로 맞춘다 - 프론트가 source
+    무관하게 같은 컴포넌트로 렌더링할 수 있어야 하기 때문."""
+    stats = context["stats"]
+    round_info = context["analysis"].get("roundInfo") or {}
+    engagement = context["analysis"].get("engagementInfo") or {}
+    recent = stats.get("recentSummary") or {}
+    total_games = (recent.get("wins", 0) or 0) + (recent.get("losses", 0) or 0)
+
+    team_label = f"{stats.get('name')} 팀" if stats.get("name") else "우리 팀"
+    intro = (
+        f"{team_label}은 최근 {total_games}경기 기준 승률 {_pct(recent.get('winRate'))}를 "
+        f"기록 중입니다. 공격과 수비 사이드 간 성과 편차가 뚜렷합니다."
+    )
+    strengths = [
+        {"stat": _pct(round_info.get('defWinRate')), "title": "수비 라운드 승률",
+         "detail": ["수비 사이드 안정적 운영"]},
+        {"stat": _pct(round_info.get('fbWinPct')), "title": "선취킬 후 마무리율",
+         "detail": ["라운드 마무리 능력 우수"]},
+        {"stat": _pct(engagement.get('trade1v1')), "title": "1대1 클러치 성공률",
+         "detail": ["단독 교전 결정력 우수"]},
+    ]
+    weaknesses = [
+        {"stat": _pct(round_info.get('ecoWinRate')), "title": "에코 라운드 승률",
+         "detail": ["경제 열세 시 운영 미흡"]},
+        {"stat": _pct(engagement.get('trade1v2')), "title": "1대2 클러치 성공률",
+         "detail": ["다수 열세 교전 판단 부족"]},
+        {"stat": _pct(round_info.get('fdLosePct')), "title": "선취 실점 후 패배율",
+         "detail": ["실점 후 만회 능력 시급"]},
+    ]
+    tactic = [
+        {"stat": "", "title": "에코 라운드 대응 강화",
+         "detail": ["경제 열세 판단 재정비", "생존 우선 원칙 수립"]},
+        {"stat": "", "title": "다수 열세 교전 대응",
+         "detail": ["1대2 교전 회피 판단 필요"]},
+    ]
+    player_feedback = [
+        {
+            "name": p["name"],
+            "role": p.get("role") or "-",
+            "acs": p.get("acs", 0),
+            "avatarUrl": p.get("avatarUrl"),
+            "strength": {
+                "stat": _pct(p.get('hs')),
+                "title": "헤드샷 비율",
+                "detail": ["팀 내 준수한 조준 지표"],
+            },
+            "weakness": {
+                "stat": "",
+                "title": "개선점 분석 대기",
+                "detail": ["AI 연동 정상화 후 제공 예정"],
+            },
+        }
+        for p in roster
+    ]
+    return {"intro": intro, "strengths": strengths, "weaknesses": weaknesses, "tactic": tactic, "playerFeedback": player_feedback}
+
+
+async def build_my_team_ai_report(db: Session, team: Team) -> dict:
+    """진입점 - routers/my_team.py::GET /ai-report가 그대로 호출.
+
+    1) 로스터를 먼저 확정(캐시 판독에도 필요 - name/role/acs/avatarUrl은 insights에
+       안 남기고 매번 최신 값을 갖다 붙인다).
+    2) 캐시(insights)가 있고 "실제 Claude가 생성한 것"이며 이 팀의 최신 매치보다
+       새로 생성된 것이면 그대로 반환 - 폴백으로 저장됐던 캐시는 재사용하지 않고
+       매번 Claude를 다시 시도한다(9-8번 - 크레딧 부족 등 일시적 실패로 폴백이
+       캐시되면 문제가 나아진 뒤에도 계속 폴백만 보이는 문제 방지). 이 경로에서만
+       API를 호출하므로, 캐시가 붙은 이후 조회는 항상 즉시 응답한다.
+    3) 아니면 Claude로 새로 생성 → 실패하면 폴백 템플릿 → 어느 쪽이든 insights에
+       source("claude"/"fallback")와 함께 저장."""
+    context = _collect_team_context(db, team)
+    roster, details = await _collect_roster_with_detail(db, team)
+
+    cached, generated_at, cached_source = _read_cached_report(db, team.team_id, roster)
+    latest_match_at = _latest_match_at(db, team.team_id)
+    is_fresh = generated_at and (latest_match_at is None or generated_at >= latest_match_at)
+    if cached and cached_source == "claude" and is_fresh:
+        return cached
+
+    system_prompt, user_prompt = _build_prompt(context, roster, details)
+    # LLM 응답은 확률적이라 가끔 로스터 중 한두 명이 playerFeedback에서 누락되는 등
+    # 스키마를 못 맞출 때가 있다(실사용 관찰 - 같은 프롬프트를 재시도하면 보통 성공함) -
+    # services/claude_client.py::generate_with_retry가 폴백 전에 몇 번 더 시도해준다.
+    # generate_with_retry 자체는 동기(블로킹) 함수라 - Claude 호출 한 번이 20초 안팎 걸리는데
+    # (2026-09-12 실측), 이 코루틴 안에서 그냥 부르면 그동안 이벤트 루프 전체가 멈춰서
+    # 같은 서버가 처리 중인 다른 모든 요청까지 같이 멈춘다. asyncio.to_thread로 별도
+    # 스레드에서 돌려 이벤트 루프를 막지 않는다.
+    report = await asyncio.to_thread(
+        generate_with_retry, system_prompt, user_prompt,
+        lambda raw: _parse_and_validate(raw, roster), log_prefix="ai_report",
+    )
+
+    source = "claude"
+    if report is None:
+        report = _fallback_report(context, roster)
+        source = "fallback"
+
+    _save_report(db, team.team_id, report, roster, source)
+    return report

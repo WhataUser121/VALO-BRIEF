@@ -1,0 +1,125 @@
+// minimaps 폴더의 모든 이미지를 한 번에 eager import
+const minimapModules = import.meta.glob('../assets/images/minimaps/*.png', { eager: true });
+
+// 실제 URL 매핑 객체로 변환
+const minimapMap = Object.entries(minimapModules).reduce((acc, [path, mod]) => {
+  const fileName = path.split('/').pop(); // 'abyss_map.png'
+  acc[fileName] = mod.default;
+  return acc;
+}, {});
+
+export const gameData = {
+  maps: [
+    { id: 'abyss', name: '어비스', image: '../assets/images/maps/abyss.png', minimap: minimapMap['abyss_map.png'], sites: ['A', 'B'] },
+    { id: 'ascent', name: '어센트', image: '../assets/images/maps/ascent.jpg', minimap: minimapMap['ascent_map.png'], sites: ['A', 'B'] },
+    { id: 'bind', name: '바인드', image: '../assets/images/maps/bind.jpg', minimap: minimapMap['bind_map.png'], sites: ['A', 'B'] },
+    { id: 'breeze', name: '브리즈', image: '../assets/images/maps/breeze.png', minimap: minimapMap['breeze_map.png'], sites: ['A', 'B'] },
+    { id: 'corrode', name: '코로드', image: '../assets/images/maps/corrode.png', minimap: minimapMap['corrode_map.png'], sites: ['A', 'B'] },
+    { id: 'fracture', name: '프랙처', image: '../assets/images/maps/fracture.png', minimap: minimapMap['fracture_map.png'], sites: ['A', 'B'] },
+    { id: 'haven', name: '헤이븐', image: '../assets/images/maps/haven.jpg', minimap: minimapMap['haven_map.png'], sites: ['A', 'B', 'C'] },
+    { id: 'icebox', name: '아이스박스', image: '../assets/images/maps/icebox.png', minimap: minimapMap['icebox_map.png'], sites: ['A', 'B'] },
+    { id: 'lotus', name: '로터스', image: '../assets/images/maps/lotus.png', minimap: minimapMap['lotus_map.png'], sites: ['A', 'B', 'C'] },
+    { id: 'pearl', name: '펄', image: '../assets/images/maps/pearl.png', minimap: minimapMap['pearl_map.png'], sites: ['A', 'B'] },
+    { id: 'split', name: '스플릿', image: '../assets/images/maps/split.png', minimap: minimapMap['split_map.png'], sites: ['A', 'B'] },
+    { id: 'summit', name: '서밋', image: '../assets/images/maps/summit.png', minimap: minimapMap['summit_map.png'], sites: ['A', 'B'] },
+    { id: 'sunset', name: '선셋', image: '../assets/images/maps/sunset.png', minimap: minimapMap['sunset_map.png'], sites: ['A', 'B'] }
+  ],
+  agents: [
+    { id: 'astra', name: '아스트라', image: '../assets/images/agents/astra.png' },
+    { id: 'breach', name: '브리치', image: '../assets/images/agents/breach.png' },
+    { id: 'brimstone', name: '브림스톤', image: '../assets/images/agents/brimstone.png' },
+    { id: 'chamber', name: '체임버', image: '../assets/images/agents/chamber.png' },
+    { id: 'clove', name: '클로브', image: '../assets/images/agents/clove.png' },
+    { id: 'cypher', name: '사이퍼', image: '../assets/images/agents/cypher.png' },
+    { id: 'deadlock', name: '데드락', image: '../assets/images/agents/deadlock.png' },
+    { id: 'fade', name: '페이드', image: '../assets/images/agents/fade.png' },
+    { id: 'gekko', name: '게코', image: '../assets/images/agents/gekko.png' },
+    { id: 'harbor', name: '하버', image: '../assets/images/agents/harbor.png' },
+    { id: 'iso', name: '아이소', image: '../assets/images/agents/iso.png' },
+    { id: 'jett', name: '제트', image: '../assets/images/agents/jett.png' },
+    { id: 'kayo', name: '케이오', image: '../assets/images/agents/kayo.png' },
+    { id: 'killjoy', name: '킬조이', image: '../assets/images/agents/killjoy.png' },
+    { id: 'miks', name: '믹스', image: '../assets/images/agents/miks.png' },
+    { id: 'neon', name: '네온', image: '../assets/images/agents/neon.png' },
+    { id: 'omen', name: '오멘', image: '../assets/images/agents/omen.png' },
+    { id: 'phoenix', name: '피닉스', image: '../assets/images/agents/phoenix.png' },
+    { id: 'raze', name: '레이즈', image: '../assets/images/agents/raze.png' },
+    { id: 'reyna', name: '레이나', image: '../assets/images/agents/reyna.png' },
+    { id: 'sage', name: '세이지', image: '../assets/images/agents/sage.png' },
+    { id: 'skye', name: '스카이', image: '../assets/images/agents/skye.png' },
+    { id: 'sova', name: '소바', image: '../assets/images/agents/sova.png' },
+    { id: 'tejo', name: '테호', image: '../assets/images/agents/tejo.png' },
+    { id: 'veto', name: '비토', image: '../assets/images/agents/veto.png' },
+    { id: 'viper', name: '바이퍼', image: '../assets/images/agents/viper.png' },
+    { id: 'vyse', name: '바이스', image: '../assets/images/agents/vyse.png' },
+    { id: 'waylay', name: '웨이레이', image: '../assets/images/agents/waylay.png' },
+    { id: 'yoru', name: '요루', image: '../assets/images/agents/yoru.png' }
+  ],
+  weapons: [
+    { id: 'ares', name: '아레스', image: '../assets/images/weapons/ares.png' },
+    { id: 'bandit', name: '밴딧', image: '../assets/images/weapons/bandit.png' },
+    { id: 'bucky', name: '버키', image: '../assets/images/weapons/bucky.png' },
+    { id: 'bulldog', name: '불독', image: '../assets/images/weapons/bulldog.png' },
+    { id: 'classic', name: '클래식', image: '../assets/images/weapons/classic.png' },
+    { id: 'frenzy', name: '프렌지', image: '../assets/images/weapons/frenzy.png' },
+    { id: 'ghost', name: '고스트', image: '../assets/images/weapons/ghost.png' },
+    { id: 'guardian', name: '가디언', image: '../assets/images/weapons/guardian.png' },
+    { id: 'judge', name: '저지', image: '../assets/images/weapons/judge.png' },
+    { id: 'marshal', name: '마샬', image: '../assets/images/weapons/marshal.png' },
+    { id: 'odin', name: '오딘', image: '../assets/images/weapons/odin.png' },
+    { id: 'operator', name: '오퍼레이터', image: '../assets/images/weapons/operator.png' },
+    { id: 'outlaw', name: '아웃로', image: '../assets/images/weapons/outlaw.png' },
+    { id: 'phantom', name: '팬텀', image: '../assets/images/weapons/phantom.png' },
+    { id: 'sheriff', name: '셰리프', image: '../assets/images/weapons/sheriff.png' },
+    { id: 'shorty', name: '쇼티', image: '../assets/images/weapons/shorty.png' },
+    { id: 'spectre', name: '스펙터', image: '../assets/images/weapons/spectre.png' },
+    { id: 'stinger', name: '스팅어', image: '../assets/images/weapons/stinger.png' },
+    { id: 'vandal', name: '밴달', image: '../assets/images/weapons/vandal.png' }
+  ],
+  tiers: {
+    personal: [
+      // NOTE(2026-09-15): id/이미지 파일명(ascendant*/immortal*)은 라이엇 공식 영문 티어명
+      // 그대로인데, 이 배열의 name(한글)이 서로 뒤바뀌어 있었다 - Ascendant(영문) =
+      // "초월자"(한글), Immortal(영문) = "불멸"(한글)인데 정반대로 적혀 있어서, "불멸"로
+      // 조회하면 ascendant*.png(초월자 아이콘)가 나오는 버그가 있었다(services/
+      // player_profile.py::TIER_LABELS는 이미 올바르게 매핑돼 있어 텍스트는 항상
+      // 맞았고, 이 파일의 name만 틀려서 아이콘만 어긋났다). id/image는 그대로 두고
+      // name만 올바르게 맞바꿨다 - 다른 코드가 id/파일명을 참조하고 있을 수 있어서
+      // 그쪽은 건드리지 않는 게 안전하다.
+      { id: 'ascendant1', name: '초월자 1', image: '../assets/images/tiers/ascendant1.png' },
+      { id: 'ascendant2', name: '초월자 2', image: '../assets/images/tiers/ascendant2.png' },
+      { id: 'ascendant3', name: '초월자 3', image: '../assets/images/tiers/ascendant3.png' },
+      { id: 'bronze1', name: '브론즈 1', image: '../assets/images/tiers/bronze1.png' },
+      { id: 'bronze2', name: '브론즈 2', image: '../assets/images/tiers/bronze2.png' },
+      { id: 'bronze3', name: '브론즈 3', image: '../assets/images/tiers/bronze3.png' },
+      { id: 'diamond1', name: '다이아몬드 1', image: '../assets/images/tiers/diamond1.png' },
+      { id: 'diamond2', name: '다이아몬드 2', image: '../assets/images/tiers/diamond2.png' },
+      { id: 'diamond3', name: '다이아몬드 3', image: '../assets/images/tiers/diamond3.png' },
+      { id: 'gold1', name: '골드 1', image: '../assets/images/tiers/gold1.png' },
+      { id: 'gold2', name: '골드 2', image: '../assets/images/tiers/gold2.png' },
+      { id: 'gold3', name: '골드 3', image: '../assets/images/tiers/gold3.png' },
+      { id: 'immortal1', name: '불멸 1', image: '../assets/images/tiers/immortal1.png' },
+      { id: 'immortal2', name: '불멸 2', image: '../assets/images/tiers/immortal2.png' },
+      { id: 'immortal3', name: '불멸 3', image: '../assets/images/tiers/immortal3.png' },
+      { id: 'iron1', name: '아이언 1', image: '../assets/images/tiers/iron1.png' },
+      { id: 'iron2', name: '아이언 2', image: '../assets/images/tiers/iron2.png' },
+      { id: 'iron3', name: '아이언 3', image: '../assets/images/tiers/iron3.png' },
+      { id: 'platinum1', name: '플래티넘 1', image: '../assets/images/tiers/platinum1.png' },
+      { id: 'platinum2', name: '플래티넘 2', image: '../assets/images/tiers/platinum2.png' },
+      { id: 'platinum3', name: '플래티넘 3', image: '../assets/images/tiers/platinum3.png' },
+      { id: 'radiant', name: '레디언트', image: '../assets/images/tiers/radiant.png' },
+      { id: 'silver1', name: '실버 1', image: '../assets/images/tiers/silver1.png' },
+      { id: 'silver2', name: '실버 2', image: '../assets/images/tiers/silver2.png' },
+      { id: 'silver3', name: '실버 3', image: '../assets/images/tiers/silver3.png' },
+      { id: 'unrated', name: '언랭크', image: '../assets/images/tiers/unrated.png' }
+    ],
+    team: [
+      { id: 'open', name: '초급', image: '../assets/images/team-tiers/open.png' },
+      { id: 'intermediate', name: '중급', image: '../assets/images/team-tiers/intermediate.png' },
+      { id: 'advanced', name: '중상급', image: '../assets/images/team-tiers/advanced.png' },
+      { id: 'elite', name: '상급', image: '../assets/images/team-tiers/elite.png' },
+      { id: 'contender', name: '최상급', image: '../assets/images/team-tiers/contender.png' },
+      { id: 'invite', name: '인바이트', image: '../assets/images/team-tiers/invite.png' }
+    ]
+  }
+};

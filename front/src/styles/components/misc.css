@@ -1,0 +1,154 @@
+/* 글로벌/공통 폰트 설정 */
+.display {
+  font-family: 'Rajdhani', 'Pretendard', sans-serif;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', 'Pretendard', monospace;
+}
+
+/* 섹션 타이틀 */
+.section-title {
+  font-family: 'Rajdhani', 'Pretendard', sans-serif;
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: 0.03em;
+  color: var(--text-1, #ffffff);
+}
+
+.section-title.mb {
+  display: block;
+  margin-bottom: 14px;
+}
+
+.section-title.spaced {
+  display: block;
+  margin: 34px 0 14px;
+}
+
+/* 태그 & 배지 (한글+숫자 호환 설정) */
+.tag {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 4px;
+  /* 영문/숫자는 JetBrains Mono, 한글은 Pretendard로 매끄럽게 처리 */
+  font-family: 'JetBrains Mono', 'Pretendard', -apple-system, sans-serif;
+  border: 1px solid var(--border);
+  color: var(--text-2, #888888);
+  background: rgba(255, 255, 255, 0.03);
+  letter-spacing: 0.02em;
+}
+
+/* 플레이스홀더 박스 */
+.empty-image-box {
+  background: var(--bg-panel-2);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  font-size: 11px;
+  font-family: 'Pretendard', sans-serif;
+  text-align: center;
+  flex-shrink: 0;
+}
+
+/* 상태 컬러 텍스트 */
+.text-win {
+  color: var(--win, #4c7eff);
+}
+
+.text-lose {
+  color: var(--lose, #ff4655);
+}
+
+.loading-state {
+  width: 100%;
+  min-height: 200px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3, 12px);
+}
+
+/* 페이지 전체가 아직 로드되지 않은 상태(다른 콘텐츠 없이 이 스피너만 표시)일 때 씀 -
+   SearchBox/HeaderSearchBar의 검색 대기 중, 그리고 프로필 페이지 자체의 데이터 로딩 중
+   모두 이 하나로 통일해서 쓴다. 기존엔 min-height: 60vh짜리 인라인 박스라 그 아래로
+   Footer(메인화면 하단부와 동일한 컴포넌트)가 그대로 보였음 - 헤더 아래(.site-header/
+   .util-header 높이 80px, header.css) 영역 전체를 덮는 고정 오버레이로 바꿔서 로딩 중엔
+   헤더만 남고 그 아래 이전 화면은 전혀 보이지 않게 함(z-index는 헤더의 100보다 위). */
+.loading-state-full {
+  position: fixed;
+  top: 80px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 500;
+  background: var(--bg-void, #0a0b0f);
+}
+
+.loading-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: loading-spin 0.7s linear infinite;
+}
+
+@keyframes loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-text {
+  color: var(--text-2);
+  font-family: 'Pretendard', sans-serif;
+  font-size: 13px;
+}
+
+.error-state__message {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-4, 16px);   
+  color: var(--accent);
+}
+
+.error-state__message::before {
+  content: '!';
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  font-family: 'Rajdhani', sans-serif;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;          
+}
+
+.error-state__message span {
+  font-family: 'Rajdhani', 'Pretendard', sans-serif;
+  font-weight: 600;
+  font-size: 18px;          
+  letter-spacing: 0.02em;
+}
+
+/* 승/패 인디케이터 도트 */
+.dot.win {
+  background: var(--win, #4c7eff);
+}
+
+.dot.lose {
+  background: var(--lose, #ff4655);
+}

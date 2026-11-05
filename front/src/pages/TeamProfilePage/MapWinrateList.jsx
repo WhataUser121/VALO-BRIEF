@@ -1,0 +1,29 @@
+import EmptyImageBox from '../../components/common/EmptyImageBox';
+import { mapKey } from '../../utils/gameDataKey';
+
+export default function MapWinrateList({ maps = [], title = '주요 맵 승률' }) {
+  const topMaps = [...maps]
+    .sort((a, b) => b.winRate - a.winRate)
+    .slice(0, 3);
+
+  return (
+    <div className="mh-box">
+      <h5>{title}</h5>
+      {topMaps.map((m) => (
+        <div className="map-row" key={m.map}>
+          <span className="map-name-cell">
+            <EmptyImageBox 
+              className="map-thumb" 
+              folder="maps" 
+              assetKey={mapKey(m.map) || m.map?.toLowerCase()} 
+              label="" 
+            />
+            {m.map}
+          </span>
+          <b>{m.win} / {m.lose}</b>
+          <b className={m.winRate >= 60 ? 'hot' : ''}>{m.winRate}%</b>
+        </div>
+      ))}
+    </div>
+  );
+}

@@ -1,2 +1,74 @@
 # VALO-BRIEF
-This project implements match history search for a live game alongside AI-powered match outcome prediction.
+Team Project
+
+Docker 배포: [설정 및 실행 안내](deploy/README.md). React/Nginx와 FastAPI를 `docker compose up -d --build`로 실행하고 기존 AWS MySQL에 연결합니다. 먼저 루트 `.env` 설정이 필요합니다.
+
+## Premier 승부예측
+
+화면에서 사용하는 `GET /api/predict/{team_name}/{team_tag}`는 로그인 팀과 상대 팀의
+Premier History(`league_matches`)를 최신순으로 정렬하고, 중복을 제거한 최대 5경기를 사용합니다.
+동일한 로그인 팀(ID·이름·태그)과 상대 팀(이름·태그), 모델 버전의 성공한 예측 응답은
+완료 시점부터 40분간 서버 메모리에 캐싱합니다. 캐시 적중 시 인증 후 이전 응답을 즉시 반환하며,
+Henrik 조회·스탯 재집계·모델 추론·예측 결과 DB 저장을 반복하지 않습니다.
+재조회로 만료 시각을 연장하지 않으며, 만료 후 다음 요청에서 새로 예측합니다.
+동시에 들어온 동일 조합 요청은 한 번의 계산을 공유하고, 실패 응답은 캐싱하지 않습니다.
+캐시는 프로세스별 최대 256개이며 초과 시 가장 오래 사용하지 않은 결과부터 제거합니다.
+서버 재시작 시 초기화되고 여러 워커 간에는 공유되지 않습니다.
+분석·AI 리포트·최근 상대 조회는 별도 요청이므로 이 캐시의 대상이 아닙니다.
+로그의 `[PREDICTION CACHE] HIT/MISS/SHARED`로 캐시 사용 여부를 확인할 수 있습니다.
+
+캐시가 없는 예측에서는 양 팀이 맞붙었던 경기 상세를 한 번만 조회하며 기존 Henrik 캐시를 재사용합니다.
+예측 요청당 History 2회, 상세 최대 10회, 팀 정보·로고 조회 2회가 필요합니다(캐시·재시도 제외).
+팀 조회 및 History 경로는 [Henrik Premier 공식 문서](https://docs.henrikdev.xyz/valorant/api-reference/premier)를 참고합니다.
+
+경기마다 해당 팀의 실제 출전 선수 5명을 집계하고 최근 유효 3~5경기를 같은 비중으로 평균냅니다.
+선수별 출전 횟수 제한은 없으며 교체 선수도 포함됩니다. 최신 유효 경기의 요원 조합만 유지합니다.
+기존 5인 피처 인터페이스에는 팀 평균값을 담은 5개 슬롯을 전달하며, 이를 특정 선수의 기록으로 취급하지 않습니다.
+누락된 상세·스탯·KAST 이벤트는 제외합니다. 팀 기록 자체가 3경기 미만인 경우와 상세 데이터 검증 후
+유효 경기가 3개 미만인 경우는 별도의 HTTP 422 안내를 반환합니다. 추가 과거 검색은 하지 않습니다.
+프론트에서는 이 오류를 mock 승률로 대체하지 않습니다. 기존 데모 및 기타 오류의 폴백은 유지합니다.
+
+기존 ACS/KD/KAST/HS%/승률 평균과 최신 요원을 사용해 18개 피처를 생성하고,
+저장된 XGBoost 모델을 한 번 실행합니다. 모델과 피처 순서는 유지하며 재학습하지 않습니다.
+선수 직접 입력용 `POST /api/predict`는 기존 개발·디버깅 경로를 유지합니다.
+상세 피처 로그는 Python 로깅의 DEBUG 수준에서 확인할 수 있습니다.
+
+`[PREMIER KAST]` 상세 로그는 기본적으로 꺼져 있습니다. `server/.env`에
+`PREMIER_KAST_DEBUG=true`를 설정하면 켜지고, `false`로 설정하면 꺼집니다.
+환경 파일을 변경한 후 서버를 재시작하세요. 프로세스 환경변수와 루트 `.env`가 우선합니다.
+이 설정은 출력만 제어하며 검증·보정과 제외 사유 수집은 유지합니다.
+`[PREMIER MATCH REJECT]`와 `[PREMIER VALIDATION SUMMARY]` 요약 로그는 계속 출력됩니다.
+
+Premier 예측의 KAST는 자기 처치·팀킬 이벤트를 일반 킬/어시스트/트레이드로 인정하지 않습니다.
+다만 어시스트 스탯 검증은 특수 이벤트를 포함한 원본 `assistants` 목록 전체를 집계합니다.
+스탯에 기록된 어시스트와 KAST에서 인정하는 어시스트를 구분하여, 특수 이벤트의 어시스트 때문에
+정상 경기가 제외되지 않도록 합니다.
+선수별 데스 스탯이 특수 사망 이벤트 전체를 포함하거나 전체를 제외한 집계와 정확히 일치하는 경우에만
+그 기준으로 생존 여부를 재계산합니다. 일부 특수 사망만 골라야 하는 모호한 경우와 설명되지 않는
+킬·데스·어시스트 불일치는 제외합니다. 이는 스탯에 근거한 보정 정책이며 실제 이벤트 의미를 확정하지는 않습니다.
+API 원본 이벤트는 변경하지 않으며, 보정 로그는 `SPECIAL_EVENTS_NORMALIZED`로 출력합니다.
+
+경기 저장 정책: 회원가입 동기화와 팀 프로필·분석 조회는 이제
+`matches`·`match_player_stats`에 신규 행이나 경기 원본을 저장하지 않습니다.
+교전 예측·학습에 필요한 팀별 경기 요약(trade_rate, duelist_acs, win)만
+`team_engagement_cache`에 저장합니다. 기존 DB 보완 작업과 원본 재저장 방식의
+`backfill_missing_agents.py`는 중단합니다. 예측 결과의 `predictions` 저장과 40분 응답 캐시는 유지합니다.
+기존 테이블·데이터는 삭제하지 않습니다. DB 전적을 읽는 우리 팀 분석·선수 상세는
+저장 중단 이전 데이터를 사용하며 신규 전적이 자동 반영되지 않습니다.
+
+검증 명령:
+
+```text
+cd server
+python -m unittest discover -s tests -p test_premier_prediction.py -v
+python -m unittest discover -s tests -p test_prediction_cache.py -v
+python -m unittest discover -s tests -p test_match_storage_policy.py -v
+cd ../front
+npm run build
+```
+
+Premier 테스트는 합성 상세 응답으로 경기 선택, 최소 경기 수, 교체 선수, 결측 데이터,
+중복 요청 방지, HTTP 422, 피처 순서 및 실제 저장 모델의 추론을 검증합니다.
+실제 API를 이용한 화면 검증과 Premier 평가 지표 재측정은 포함하지 않습니다.
+향후 평가에서는 예측 대상 경기보다 이전 경기만 피처에 사용해야 합니다.
+기존 모델은 Premier 전용 학습 모델이므로 입력 분포 변화에 따른 성능 검증이 필요합니다.

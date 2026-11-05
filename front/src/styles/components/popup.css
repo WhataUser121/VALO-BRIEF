@@ -1,0 +1,353 @@
+/* QuickAnalysisModal (3초 상대분석 팝업) */
+
+.wl-legend {
+  display: flex;
+  justify-content: center;
+  gap: 14px;
+  font-size: 11px;
+  color: var(--text-2);
+  margin-bottom: 10px;
+}
+
+.wl-legend .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 5px;
+}
+
+.popup-search-area {
+  padding: 16px 20px 0 20px;
+}
+
+.popup-team-hero {
+  padding: 16px 24px 16px 28px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* [수정 완료] 라이트 모드에서는 var(--text-1) 혹은 검은색 계열로 동작하며 다크 모드 감싸는 구조나 기존 톤을 유지합니다 */
+.popup-team-name {
+  font-size: 24px;
+  color: var(--text-1, #111111);
+  letter-spacing: -0.5px;
+}
+
+/* 만약 프로젝트에 별도의 다크모드 클래스(.dark 등)로 분기되어 있다면 아래 주석처럼 대응할 수도 있습니다. 
+   현재 스타일 파일의 다른 부분에서 var(--text-1)을 흰색 계열로 쓰고 계시다면 위 코드 그대로 다크모드가 유지됩니다. */
+
+.popup-team-tag {
+  font-size: 15px;
+  color: var(--text-2);
+  font-weight: 700;
+}
+
+/* ============ 3초 상대 분석 POPUP ============ */
+.popup-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  padding: 20px;
+}
+
+.popup-card {
+  width: 100%;
+  max-width: 600px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid var(--accent-dim);
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px rgba(255, 70, 85, 0.1), 0 30px 60px rgba(0, 0, 0, 0.5);
+  position: relative;
+  z-index: 10000;
+  overflow: hidden;
+}
+
+/* 팝업 헤더 */
+.popup-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 26px;
+  border-bottom: 1px solid var(--border-soft);
+  flex-shrink: 0;
+}
+
+.popup-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.popup-close-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-2);
+  font-size: 20px;
+  cursor: pointer;
+  padding: 4px 8px;
+  line-height: 1;
+  transition: color 0.2s ease;
+}
+
+.popup-close-btn:hover {
+  color: var(--text-1);
+}
+
+/* 팝업 바디 */
+.popup-body {
+  padding: 24px 26px;
+  overflow-y: auto;
+  flex: 1;
+  transition: opacity 0.15s ease;
+}
+
+.popup-body.is-loading {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.popup-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.popup-body::-webkit-scrollbar-thumb {
+  background: var(--border-soft, rgba(255, 255, 255, 0.15));
+  border-radius: 3px;
+}
+
+/* [수정] 박스 간 상단/하단 여백 확대 (22px -> 28px) */
+.p-box {
+  margin-bottom: 28px;
+}
+
+.p-box:last-child {
+  margin-bottom: 0;
+}
+
+/* [수정] 1, 2, 3 번호 라인 타이틀 폰트 크기 확대 (13px -> 15px) 및 두께 강화 */
+.p-box-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-1);
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.p-box-title .num {
+  color: var(--accent);
+  font-weight: 800;
+}
+
+.wl-strip {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+/* W/L 칩 */
+.wl-chip {
+  flex: 1;
+  height: 44px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 900;
+  color: #fff;
+  transition: all 0.2s ease;
+}
+
+/* 승리(W) 칩 */
+.wl-chip.w {
+  background: color-mix(in srgb, var(--success, #10b981) 25%, transparent);
+  border: 1px solid color-mix(in srgb, var(--success, #10b981) 50%, transparent);
+  color: var(--success, #34d399);
+}
+
+/* 패배(L) 칩 */
+.wl-chip.l {
+  background: color-mix(in srgb, var(--lose, #ff4655) 25%, transparent);
+  border: 1px solid color-mix(in srgb, var(--lose, #ff4655) 50%, transparent);
+  color: var(--lose, #ff4655);
+}
+
+.tier-row {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding-left: 12px; 
+}
+
+.tier-badge-img {
+  width: 64px;
+  height: 64px;
+  background: var(--bg-panel-3);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: var(--text-3);
+  text-align: center;
+}
+
+.tier-info {
+  flex-shrink: 0;
+}
+
+.tier-info .tdiv {
+  font-size: 16px;
+  color: var(--text-2);
+  margin-bottom: 2px;
+}
+
+.tier-info .trp {
+  font-size: 24px;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text-1);
+}
+
+.barplot-wrap {
+  width: 120px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.barplot-track {
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 5px;
+}
+
+.barplot-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+.barplot-wrap .barplot-label {
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+/* ============ p-stats-row (상대 팀 전적 하단 지표) ============ */
+.p-stats-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 16px;
+  padding: 8px 0;
+}
+
+.p-stats-row .stat-item {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  padding: 0;
+  position: relative;
+}
+
+/* 아이템 사이 세로 구분선 */
+.p-stats-row .stat-item:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  top: 15%;
+  height: 70%;
+  width: 1px;
+  background: var(--border-soft, rgba(255, 255, 255, 0.15));
+}
+
+/* 윗줄 라벨 (13px) */
+.p-stats-row .stat-label {
+  font-size: 13px;
+  color: var(--text-3, #888888);
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+
+/* 아랫줄 수치 (18px) */
+.p-stats-row .stat-value {
+  font-size: 18px;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif;
+  color: var(--text-1, #ffffff);
+  line-height: 1.2;
+}
+
+/* 초록색 하이라이트 */
+.p-stats-row .win-text,
+.p-stats-row .rate-win {
+  color: var(--success, #34d399) !important;
+}
+
+/* 상세보기 하단 버튼 */
+.popup-cta-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.popup-cta-toast {
+  position: absolute;
+  bottom: 100%;
+  right: 26px;
+  margin-bottom: 6px;
+  background-color: rgba(20, 10, 12, 0.95);
+  color: #ff6b6b;
+  border: 1px solid rgba(255, 70, 85, 0.4);
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  white-space: nowrap;
+  z-index: 10;
+}
+
+.popup-cta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 16px 26px;
+  background: rgba(0, 0, 0, 0.2);
+  border: none;
+  border-top: 1px solid var(--border-soft);
+  box-shadow: none;
+  outline: none;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 700;
+  text-decoration: none;
+  flex-shrink: 0;
+  transition: background 0.2s ease, opacity 0.2s ease;
+}
+
+.popup-cta:hover {
+  background: rgba(255, 70, 85, 0.08);
+  opacity: 0.9;
+  text-decoration: underline;
+  box-shadow: none;
+}

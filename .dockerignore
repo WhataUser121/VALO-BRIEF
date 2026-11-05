@@ -1,0 +1,16 @@
+.git
+**/.env
+**/.env.*
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+**/.venv
+**/venv
+**/tests
+**/*.ipynb
+**/*.sql
+**/*.log
+.codex
+.agents
+server/static/team_icons

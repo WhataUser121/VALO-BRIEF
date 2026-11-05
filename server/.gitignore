@@ -1,0 +1,9 @@
+# Python
+.env
+.venv
+.venv/__pychache__
+#*.pkl
+*.csv
+__pycache__/
+*.__pycache__
+static/team_icons/

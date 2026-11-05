@@ -1,0 +1,455 @@
+/* AiReportCard, PhaseRow, PickPriorityList, PlayerFeedbackCard */
+
+.popup-head {
+  padding: 26px 30px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: linear-gradient(90deg, var(--accent-soft), transparent);
+  border-bottom: 1px solid var(--border);
+}
+
+.popup-head.plain {
+  padding: 0;
+  background: none;
+  border-bottom: none;
+  margin-bottom: 28px;
+}
+
+.bolt {
+  width: 20px;
+  height: 20px;
+  background: var(--accent);
+  clip-path: polygon(60% 0, 100% 0, 40% 60%, 70% 60%, 20% 100%, 35% 45%, 0 45%);
+}
+
+.popup-title {
+  font-size: 21px;
+}
+
+.popup-title.lg {
+  font-size: 23px;
+}
+
+.ai-report-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 40px 36px;
+  margin-bottom: 36px;
+}
+
+.ai-intro {
+  font-size: 16.5px;
+  color: var(--text-2);
+  line-height: 1.85;
+  margin-bottom: 38px;
+  padding-bottom: 32px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.ai-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 36px;
+  margin-bottom: 40px;
+}
+
+.ai-strength-title {
+  font-size: 19px;
+  font-weight: 700;
+  margin-bottom: 22px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ai-strength-title.win {
+  color: var(--win);
+}
+
+.ai-strength-title.lose {
+  color: var(--lose);
+}
+
+/* 강점/약점 항목 - 세로 스택: (번호+제목 한 줄) -> stat 뱃지 -> 설명.
+   이전엔 번호와 본문 전체(뱃지+제목+설명)를 좌우로 나열하는 flex였는데,
+   번호가 제목 옆에 바로 오도록 요청받아 block 레이아웃으로 변경. */
+.ai-list-item {
+  display: block;
+  font-size: 15px;
+  color: var(--text-2);
+  line-height: 1.75;
+  margin-bottom: 22px;
+}
+
+.ai-list-item:last-child {
+  margin-bottom: 0;
+}
+
+.ai-list-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.ai-list-item .num {
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.ai-list-item .num.win {
+  color: var(--win);
+}
+
+.ai-list-item .num.lose {
+  color: var(--lose);
+}
+
+/* .ai-list-head 안에서 번호 옆에 바로 붙는 제목 전용 스타일.
+   .ai-list-title(아래 정의, block + margin-bottom)과는 별도 클래스 -
+   여긴 번호와 한 줄에 나란히 와야 해서 inline 성격이 달라 분리했다. */
+.ai-item-title {
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--text-1);
+}
+
+/* 강점/약점/전술 제안 공통 stat 뱃지 (AiReportCard, PlayerFeedbackCard).
+   프로젝트 기존 토큰(--win/--lose/--accent)을 재사용해 다른 강조색과 톤을
+   맞춘다. margin-bottom으로 아래 설명 텍스트와 간격을 준다. */
+.stat-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 3px;
+  font-weight: 600;
+  font-size: 13px;
+  margin-right: 8px;
+  margin-bottom: 8px;
+  vertical-align: middle;
+}
+
+.stat-badge.win {
+  background: transparent;
+  border: 1px solid var(--win);
+  color: var(--win);
+}
+
+.stat-badge.lose {
+  background: transparent;
+  border: 1px solid var(--lose);
+  color: var(--lose);
+}
+
+/* 전술 제안(tactic)의 stat 뱃지는 --accent(사이트 브랜드 색, 시각적으로
+   빨강/핑크 계열)를 쓰지 않는다 - 전술 제안은 강점(win)도 약점(lose)도
+   아닌 중립 섹션인데 --accent가 --lose와 비슷한 색이라 "여기도 약점인가?"
+   하는 혼동을 줬다. 흰색 계열 중립 뱃지로 교체.
+   (2026-09-18: 하드코딩 흰색 → 테마 변수로 교체 - 라이트 모드에서 밝은
+   배경에 밝은 테두리/글씨가 겹쳐 안 보이던 문제) */
+.stat-badge.accent {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  color: var(--text-1);
+}
+
+/* 상대 요원 선택 분석(OpponentPickAnalysis) 문장 안에 섞여 나오는 선수 닉네임을
+   나머지 텍스트와 명확히 구분해서 보여준다. */
+.ai-player-name {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+/* 강점/약점 리스트 전체와 전술 제안 박스 사이 간격 */
+.ai-tactic-box {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  padding: 26px 28px;
+  font-size: 15px;
+  color: var(--text-2);
+  line-height: 1.85;
+  margin-top: 48px;
+  margin-bottom: 40px;
+}
+
+/* 전술 제안 제목 - 이전엔 var(--accent)(빨강)이었는데, 강점/약점과 달리
+   전술 제안은 중립 섹션이라 흰색으로 통일. */
+.ai-tactic-heading {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-1);
+  margin-bottom: 18px;
+}
+
+.ai-tactic-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 20px;
+}
+
+.ai-tactic-item {
+  background: var(--bg-panel);
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  padding: 18px 20px;
+}
+
+.ai-tactic-item-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+/* 전술 제안 번호 원 - 이전엔 --accent-soft/--accent(빨강 계열)였는데
+   중립 흰색 원으로 교체(위 .ai-tactic-heading과 같은 이유).
+   (2026-09-18: 하드코딩 흰색 배경 → 테마 변수로 교체) */
+.tactic-num {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--bg-panel-3);
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ai-report-section {
+  margin-top: 44px;
+}
+
+/* 페이즈는 항상 정확히 4개(PHASE_LABELS) - 3열로 나누면 마지막 줄에 1개만 남아
+   어색한 여백이 생겨서(실사용 지적) 2x2로 고정한다. */
+.ai-phase-row {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+  margin-bottom: 40px;
+}
+
+.ai-phase-box {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  padding: 22px 22px 20px;
+}
+
+/* phase-label(구매/초반/중반/후반 페이즈)은 한글 텍스트라 모노스페이스
+   영문 폰트(JetBrains Mono)를 지정하면 한글 글리프가 없어 폴백 폰트로
+   렌더링되고, 거기에 letter-spacing까지 더해져 글자 간격이 벌어져
+   보였다(2026-09-14 확인) - 모노스페이스/letter-spacing 제거, 대신
+   font-weight로 강조. */
+.ai-phase-box .phase-label {
+  font-size: 14px;
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 14px;
+}
+
+/* 페이즈 본문도 강점/약점/전술과 같은 "제목 + stat 뱃지 + 개조식 detail" 구조로
+   통일한다(2026-09-13) - 예전엔 문장 하나(<p>{text}</p>)를 그대로 박아 넣어서
+   페이즈 4개가 전부 긴 문단으로 나열되는 게 산만하다는 지적이 있었다. 실제
+   .ai-list-title/.ai-list-detail 스타일은 아래 공용 선택자 목록에 .ai-phase-box를
+   추가해서 상속받는다. */
+
+/* 2026-09-13: 통문단 하나(<p>{text}</p>)를 강점/약점/전술/페이즈와 같은
+   "제목 + stat 뱃지 + 개조식 detail" 카드로 통일 - .ai-list-title/.ai-list-detail
+   스타일은 아래 공용 선택자 목록에 .ai-pick-analysis-box를 추가해서 상속받는다. */
+.ai-pick-analysis-box {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  padding: 22px 24px 20px;
+  margin-bottom: 32px;
+}
+
+.ai-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 18px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.ai-pick-row:last-child {
+  border: none;
+}
+
+.ai-pick-rank {
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.ai-pick-thumb {
+  width: 38px;
+  height: 38px;
+  border-radius: 5px;
+  background: var(--bg-panel-3);
+  flex-shrink: 0;
+}
+
+.ai-pick-name {
+  font-size: 16px;
+  font-weight: 700;
+  width: 84px;
+  flex-shrink: 0;
+}
+
+.ai-pick-reason {
+  font-size: 15px;
+  color: var(--text-2);
+  line-height: 1.65;
+}
+
+/* ===== PlayerFeedbackCard 관련 스타일 - 이번 요청 범위 밖, 변경 없음 ===== */
+
+.ai-feedback-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 28px 32px;
+  margin-bottom: 24px;
+  display: flex;
+  gap: 22px;
+}
+
+.ai-feedback-body {
+  flex: 1;
+}
+
+.ai-feedback-avatar {
+  width: 52px;
+  height: 52px;
+  border-radius: 8px;
+  background: var(--bg-panel-3);
+  flex-shrink: 0;
+  object-fit: cover;
+}
+
+.ai-feedback-name {
+  font-size: 17px;
+  font-weight: 700;
+  margin-bottom: 16px;
+  color: var(--text-1);
+}
+
+.ai-feedback-name .tag {
+  font-weight: 400;
+  color: var(--text-3);
+  font-size: 13px;
+  margin-left: 8px;
+  border: none;
+  padding: 0;
+}
+
+.ai-feedback-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 28px;
+}
+
+.ai-feedback-cols .lbl {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+.ai-feedback-cols p {
+  font-size: 14px;
+  color: var(--text-2);
+  line-height: 1.75;
+  margin: 0 0 12px 0;
+}
+
+.ai-feedback-cols p:last-child {
+  margin-bottom: 0;
+}
+
+/* 전술 제안(tactic)의 title/detail은 .ai-list-body로 감싸 여기 규칙을 그대로
+   타고, 선수 피드백(PlayerFeedbackCard)은 .ai-feedback-cols, 라운드 페이즈
+   (PhaseRow)는 .ai-phase-box, 상대 요원 선택 분석(OpponentPickAnalysis)은
+   .ai-pick-analysis-box 스코프로 같은 흰색/회색 톤을 공유한다.
+   (2026-09-18: 하드코딩 흰색(rgba 255,255,255) → 테마 변수(--text-1/--text-2)로
+   교체 - 라이트 모드에서 밝은 배경 위에 흰 글씨가 그대로 남아 안 보이던 문제) */
+.ai-list-body .ai-list-title,
+.ai-feedback-cols .ai-list-title,
+.ai-phase-box .ai-list-title,
+.ai-pick-analysis-box .ai-list-title {
+  display: block;
+  margin: 0 0 8px;
+  font-weight: 500;
+  font-size: 15px;
+  color: var(--text-1);
+}
+
+.ai-list-body .ai-list-detail,
+.ai-feedback-cols .ai-list-detail,
+.ai-list-item .ai-list-detail,
+.ai-phase-box .ai-list-detail,
+.ai-pick-analysis-box .ai-list-detail {
+  margin: 0;
+  line-height: 1.55;
+  font-size: 14px;
+  color: var(--text-2);
+}
+
+.ai-list-body .ai-list-detail + .ai-list-detail,
+.ai-feedback-cols .ai-list-detail + .ai-list-detail,
+.ai-list-item .ai-list-detail + .ai-list-detail,
+.ai-phase-box .ai-list-detail + .ai-list-detail,
+.ai-pick-analysis-box .ai-list-detail + .ai-list-detail {
+  margin-top: 2px;
+}
+
+/* 강점/약점(win/lose) 색상 전제인 .ai-strength-title 대신, 상대 요원 선택 분석처럼
+   중립 톤 섹션 제목에 쓰는 전용 클래스. */
+.ai-section-heading {
+  font-size: 19px;
+  font-weight: 700;
+  color: var(--text-1);
+  margin-bottom: 22px;
+}
+
+.ai-pick-analysis-box {
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius-md);
+  padding: 22px 24px 20px;
+  margin-bottom: 32px;
+}
+
+.ai-pick-analysis-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.ai-pick-analysis-head .ai-list-title {
+  margin: 0;
+}
+
+.ai-pick-analysis-box .stat-badge {
+  margin: 0;
+  flex-shrink: 0;
+}

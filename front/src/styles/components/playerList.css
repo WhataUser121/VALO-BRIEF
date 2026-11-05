@@ -1,0 +1,150 @@
+/* 우리팀 분석 - 개인분석 탭 유저 리스트 (요청하신 완벽한 여백과 정렬 반영) */
+
+.player-list-head {
+  display: grid;
+  grid-template-columns: 2.5fr 1fr 1.5fr 0.8fr 0.8fr 0.8fr 0.8fr 24px;
+  gap: 16px;
+  padding: 0 24px 12px 24px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  align-items: center;
+}
+
+/* '선수' 헤더 타이틀을 데이터 이름 위치와 완벽하게 동기화 */
+.player-list-head span:nth-child(1) {
+  padding-left: 36px;
+}
+
+.player-list-head span:nth-child(2),
+.player-list-head span:nth-child(3) {
+  text-align: center;
+}
+
+.player-list-sort-head {
+  cursor: pointer;
+  text-align: center;
+  user-select: none;
+}
+
+.player-list-sort-head:hover {
+  color: var(--text-1);
+}
+
+.player-row {
+  display: grid;
+  grid-template-columns: 2.5fr 1fr 1.5fr 0.8fr 0.8fr 0.8fr 0.8fr 24px;
+  gap: 16px;
+  align-items: center;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px 24px;
+  margin-bottom: 10px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.player-row:hover {
+  background: var(--bg-panel-hover);
+  border-color: var(--border-strong);
+}
+
+.player-row.selected {
+  border-color: var(--accent);
+}
+
+.player-stat-val.selected {
+  color: var(--accent);
+}
+
+/* 선수 이름 영역: 왼쪽 여백을 크게 주어 오른쪽으로 시원하게 당김 */
+.player-id-cell {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-left: 36px;
+}
+
+/* 리스트 맨 앞 프로필 사진 */
+.player-avatar-thumb {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  background: var(--bg-panel-3);
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.player-id-cell .pid {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-1);
+}
+
+.player-id-cell .ptag {
+  font-size: 12px;
+  color: var(--text-3);
+  margin-left: 6px;
+}
+
+/* 티어 아이콘 영역: 중앙 정렬 */
+.player-tier-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.player-tier-icon {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+  flex-shrink: 0;
+}
+
+/* 모스트 요원 영역: 중앙 정렬 */
+.player-agent-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.player-agent-thumb {
+  width: 30px;
+  height: 30px;
+  border-radius: 5px;
+  background: var(--bg-panel-3);
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.player-stat-val {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text-1);
+  text-align: center;
+}
+
+.player-row-arrow {
+  color: var(--text-3);
+  text-align: center;
+  font-size: 12px;
+}
+
+.user-select {
+  display: flex;
+  align-items: center;
+  margin-top: 20px; 
+  padding: 4px 4px 12px 4px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+
+.user-select .player-name {
+  color: var(--text-1);
+}
+
+.user-select-link {
+  cursor: pointer;
+}

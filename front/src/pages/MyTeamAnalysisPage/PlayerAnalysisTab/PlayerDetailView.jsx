@@ -1,0 +1,183 @@
+import { useState } from 'react';
+import StatInlineGrid from '../../../components/common/StatInlineGrid';
+import EmptyImageBox from '../../../components/common/EmptyImageBox';
+import DropdownSelect from '../../../components/common/DropdownSelect';
+import LineChart from '../../../components/common/LineChart';
+import ProfileHeader from '../../../components/profile/ProfileHeader';
+import { gameData } from '../../../constants/gameData';
+
+// assets 경로에서 히트박스 이미지 import
+import headImg from '@/assets/images/aim/head.png';
+import bodyImg from '@/assets/images/aim/body.png';
+import legImg from '@/assets/images/aim/leg.png';
+
+/** 가장 높은 타격 비율의 부위를 찾아 해당 이미지 객체를 반환하는 헬퍼 함수 */
+const getHighestHitzoneImage = (hitzones) => {
+  if (!hitzones || hitzones.length === 0) return bodyImg;
+
+  // pct 수치가 가장 높은 영역 찾기
+  const maxZone = hitzones.reduce((prev, current) => {
+    return (prev.pct > current.pct) ? prev : current;
+  });
+
+  // 부위명 매핑
+  switch (maxZone.zone) {
+    case '헤드':
+    case 'Head':
+      return headImg;
+    case '바디':
+    case 'Body':
+      return bodyImg;
+    case '레그':
+    case 'Leg':
+      return legImg;
+    default:
+      return bodyImg;
+  }
+};
+
+/** Frame 11 — 선수 상세 (라운드 정보 / 에임 정보 / 교전 정보) */
+export default function PlayerDetailView({ player, onBack }) {
+  const { aim, engagement } = player;
+
+  // 드롭다운에는 이 선수가 실제로 뛴 맵만 표시한다(TeamAnalysisTab.jsx와 동일한 방식) -
+  // 목데이터처럼 13개 맵이 항상 다 있는 게 아니라, 실제로는 player.roundInfoByMap에
+  // 이 선수가 뛴 맵만 키로 들어있다.
+  const playedMapNames = Object.keys(player.roundInfoByMap).filter((name) => name !== '전체 맵');
+  const mapOptions = [
+    '전체 맵',
+    ...gameData.maps.filter((m) => playedMapNames.includes(m.name)).map((m) => m.name),
+  ];
+
+  const [selectedMap, setSelectedMap] = useState('전체 맵');
+  // 방어적 기본값 - selectedMap에 해당하는 데이터가 없으면(이론상 발생하지 않아야 하지만) 0으로 채운다.
+  const roundInfo = player.roundInfoByMap[selectedMap] ?? {
+    atkKd: 0, atkAcs: 0, defKd: 0, defAcs: 0, fbPct: 0, fdPct: 0, pistolKd: 0, pistolAcs: 0, ecoKd: 0, ecoAcs: 0,
+  };
+
+  // 타격 비율 중 가장 높은 부위에 맞는 이미지 모듈 산출
+  const activeHitboxImg = getHighestHitzoneImage(aim.hitzones);
+
+  return (
+    <>
+      <div className="user-select">
+        👤 <b className="player-name">{player.name} #{player.tag}</b> 선택됨 — <span className="user-select-link" onClick={onBack}>다른 선수 보기 ▾</span>
+      </div>
+
+      {/* 어떤 선수가 선택됐는지 개인 검색 페이지와 동일한 프로필 카드로 표시 */}
+      <ProfileHeader
+        type="player"
+        name={player.name}
+        tag={player.tag}
+        level={player.level}
+        title={player.title}
+        avatarUrl={player.avatarUrl}
+        showSeasonSelect={false}
+      />
+
+      {/* 라운드 정보 */}
+      <div className="analysis-row">
+        <div className="analysis-row-head">
+          <h5>① 라운드 정보</h5>
+          <DropdownSelect icon="🗺" label={selectedMap} options={mapOptions} value={selectedMap} onChange={setSelectedMap} />
+        </div>
+        <div className="subsection-title">공격 / 수비</div>
+        <StatInlineGrid
+          columns={6}
+          items={[
+            { label: '공격 K/D', value: roundInfo.atkKd },
+            { label: '공격 ACS', value: roundInfo.atkAcs },
+            { label: '수비 K/D', value: roundInfo.defKd },
+            { label: '수비 ACS', value: roundInfo.defAcs },
+            { label: 'FB 비율', value: `${roundInfo.fbPct}%`, sub: '선취 킬' },
+            { label: 'FD 비율', value: `${roundInfo.fdPct}%`, sub: '선취 데스' },
+          ]}
+        />
+        <div className="subsection-title">피스톨 / Eco</div>
+        <StatInlineGrid
+          columns={4}
+          items={[
+            { label: '피스톨 K/D', value: roundInfo.pistolKd },
+            { label: '피스톨 ACS', value: roundInfo.pistolAcs },
+            { label: 'Eco K/D', value: roundInfo.ecoKd },
+            { label: 'Eco ACS', value: roundInfo.ecoAcs },
+          ]}
+        />
+      </div>
+
+      {/* 에임 관련 정보 */}
+      <div className="analysis-row">
+        <div className="analysis-row-head"><h5>② 에임 관련 정보</h5></div>
+        <div className="subsection-title">타격 비율 · 사용 무기별 스탯</div>
+        <div className="aim-dual">
+          <div>
+            <div className="aim-col-title">타격 비율</div>
+            <div className="hitbox-container">
+              <div className="hitbox-img-wrap">
+                <EmptyImageBox
+                  className="hitbox-img full"
+                  src={activeHitboxImg}
+                  alt="주요 타격부위 히트박스"
+                  label={`히트박스 이미지\n영역 (부위별 타격률 오버레이)`}
+                />
+              </div>
+              <div className="hitzone-list">
+                {aim.hitzones.map((h) => (
+                  <div className="hitzone-row" key={h.zone}>
+                    {h.zone}
+                    <div className="hitzone-bar"><span style={{ width: `${h.pct}%` }} /></div>
+                    <b>{h.pct}%</b>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+          <div>
+            <div className="aim-col-title">사용 무기별 스탯</div>
+            <div className="weapon-list-wrap">
+              {aim.weapons.map((w) => (
+                <div className="weapon-row" key={w.name}>
+                  <EmptyImageBox className="weapon-icon" folder="weapons" assetKey={w.name} label={`${w.name}\nICON`} />
+                  <div className="weapon-name">{w.name}</div>
+                  <div className="weapon-stats">
+                    <div>K/D<b>{w.kd}</b></div>
+                    <div>ADR<b>{w.adr}</b></div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+        <div className="subsection-title">클러치</div>
+        <div className="clutch-row">
+          <div className="clutch-chip"><div className="lbl">1v1 성공률</div><div className="val">{aim.clutch['1v1']}%</div></div>
+          <div className="clutch-chip"><div className="lbl">1v2 성공률</div><div className="val">{aim.clutch['1v2']}%</div></div>
+          <div className="clutch-chip"><div className="lbl">1v3+ 성공률</div><div className="val">{aim.clutch['1v3plus']}%</div></div>
+        </div>
+      </div>
+
+      {/* 교전 정보 */}
+      <div className="analysis-row">
+        <div className="analysis-row-head"><h5>③ 교전 정보</h5></div>
+
+        <div className="duel-compare-block">
+          <div className="duel-compare-title">트레이드 성공률 (내가 죽은 교전에서 상대도 같이 죽는지)</div>
+          <StatInlineGrid
+            columns={2}
+            items={[
+              { label: '기본 트레이드 (상대 1명↑)', value: `${engagement.trade1v1}%` },
+              { label: '가치 트레이드 (상대 2명↑)', value: `${engagement.trade1v2}%` },
+            ]}
+          />
+        </div>
+
+        <div className="duel-compare-block">
+          <div className="duel-compare-title">교전 거리 분포</div>
+          <div className="line-chart-wrap">
+            <LineChart points={engagement.distanceDistribution} />
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
